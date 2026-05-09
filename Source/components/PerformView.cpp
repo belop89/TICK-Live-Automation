@@ -300,7 +300,7 @@ void PerformView::mouseDown (const juce::MouseEvent& e)
     if (e.originalComponent == &topBar.tapMode)
     {
         topBar.tapMode.setColour (juce::Label::backgroundColourId, TickLookAndFeel::Colours::wood);
-        tapModel.pushTap (e.eventTime);
+        tapModel.pushTap (juce::Time::getMillisecondCounter());
         if (tapModel.getLastDetectedBPM() > 0)
             state.transport.bpm.setValue ((float) tapModel.getLastDetectedBPM(), nullptr);
         return;

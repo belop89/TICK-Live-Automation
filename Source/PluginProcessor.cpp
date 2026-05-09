@@ -294,7 +294,7 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     // 1. Endast trigga på stigande flank (rising edge) för att undvika dubbel-triggering
     if (tapTempoParam)
     {
-        const bool curState = tapTempoParam->get() > 0.5f;
+        const bool curState = tapTempoParam->get();
         const bool prevState = lastTapButtonState.load(std::memory_order_relaxed);
 
         if (curState && ! prevState)
