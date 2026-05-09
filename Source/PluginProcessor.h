@@ -123,6 +123,8 @@ private:
 
     juce::dsp::StateVariableTPTFilter<float> lpfFilter;
     float lastCutoffHz { -1.0f };
+    float lastMasterGainDb { -1000.0f };
+    float masterGainMultiplier { 1.0f };
     //==============================================================================
     // Parameters
     std::atomic<float> tickMultiplier {1.0f};

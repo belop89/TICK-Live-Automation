@@ -75,7 +75,7 @@ public:
     void drawComboBox (juce::Graphics& g, int width, int height, bool /*isButtonDown*/, int /*buttonX*/, int /*buttonY*/, int /*buttonW*/, int /*buttonH*/, juce::ComboBox& combo) override
     {
         g.setColour (combo.findColour (juce::ComboBox::ColourIds::backgroundColourId));
-        g.fillRoundedRectangle (0, 0, width, height, 4);
+        g.fillRoundedRectangle (0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 4.0f);
     }
 
     void drawButtonBackground (juce::Graphics& g, juce::Button& b, const juce::Colour& backgroundColour, bool shouldDrawButtonAsHighlighted, bool shouldDrawButtonAsDown) override

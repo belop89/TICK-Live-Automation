@@ -8,5 +8,5 @@ cmake --build ./build --clean-first --target TICK_VST3 --config RelWithDebInfo
 echo Building Windows Installer (NSIS)...
 cmake --build ./build --target PACKAGE --config RelWithDebInfo
 
-echo Build and Packaging Complete! Look in the /build/ folder for your Setup.exe
+echo Build and Packaging Complete! Look in the /build/ folder for TICK-Live-Automation-[version].exe
 pause

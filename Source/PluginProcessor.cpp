@@ -568,7 +568,14 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     juce::dsp::ProcessContextReplacing<float> context (block);
     lpfFilter.process (context);
 
-    buffer.applyGain (Decibels::decibelsToGain (currentMasterGain));
+    // DSP-Optimering: Anropa inte 'std::pow' (decibelsToGain) för varje ljudblock!
+    // Cacha multiplikatorn och uppdatera bara när volymen faktiskt ändras av användaren.
+    if (lastMasterGainDb != currentMasterGain)
+    {
+        masterGainMultiplier = juce::Decibels::decibelsToGain (currentMasterGain);
+        lastMasterGainDb = currentMasterGain;
+    }
+    buffer.applyGain (masterGainMultiplier);
 
     // LIVE SHOW OPTIMERING: Avancera standalone-tidslinjen HÄR i slutet av blocket!
     // Om vi gör det i början av processBlock hamnar MIDI-klockan och audioklicket 1 ljudblock i "framtiden",

@@ -46,7 +46,6 @@ private:
         void handleDrag (const juce::MouseEvent& e)
         {
             const auto newstep = e.getDistanceFromDragStartY();
-            ;
             if (std::abs (newstep - dragStep) > 1)
             {
                 if (newstep - dragStep > 0)

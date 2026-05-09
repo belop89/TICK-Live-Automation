@@ -117,15 +117,20 @@ void PerformView::resized()
     const auto numOfBeats = state.transport.numerator.get();
     beatsView.setBounds (area.withHeight (std::max (area.getHeight(), (isVertical ? state.transport.numerator.get() : (int) std::ceil (numOfBeats / beatsInRow)) * (beatSize + 2 * kMargin) + kMargin)).withWidth (area.getWidth() - viewport.getScrollBarThickness()));
     juce::FlexBox fb (isVertical ? juce::FlexBox::Direction::column : juce::FlexBox::Direction::row, juce::FlexBox::Wrap::wrap, juce::FlexBox::AlignContent::flexStart, juce::FlexBox::AlignItems::center, juce::FlexBox::JustifyContent::flexStart);
+    
+    const float fBeatHeight = static_cast<float> (beatHeight);
+    const float fItemWidth = static_cast<float> (itemWidth);
+    const float fMargin = static_cast<float> (kMargin);
+
     for (auto& beat : beats)
     {
         juce::FlexItem newItem (*beat);
         fb.items.add (newItem.withFlex (1.0f)
-                          .withMinHeight (beatHeight)
-                          .withMinWidth (itemWidth)
-                          .withMaxHeight (beatHeight)
-                          .withMaxWidth (itemWidth)
-                          .withMargin (juce::FlexItem::Margin (kMargin)));
+                          .withMinHeight (fBeatHeight)
+                          .withMinWidth (fItemWidth)
+                          .withMaxHeight (fBeatHeight)
+                          .withMaxWidth (fItemWidth)
+                          .withMargin (juce::FlexItem::Margin (fMargin)));
     }
     fb.performLayout (beatsView.getLocalBounds());
 }
@@ -152,10 +157,15 @@ void PerformView::update (double currentPos)
     for (size_t num = 0; num < (size_t) numOfBeats; num++)
     {
         auto& beat = *beats[num];
+        const bool wasOn = beat.isOn;
+        const bool wasCurrent = beat.isCurrent;
+        const float oldPos = beat.relativePos;
+
         beat.isOn = num < currentBeat;
         beat.isCurrent = num == currentBeat;
         beat.relativePos = static_cast<float> (beat.isCurrent ? barPos : 0.0);
-        beat.repaint();
+        if (wasOn != beat.isOn || wasCurrent != beat.isCurrent || beat.relativePos != oldPos)
+            beat.repaint();
         if (state.transport.isPlaying.get() && ! isEditMode && beat.isCurrent && (viewport.getViewArea().getBottom() < beat.getY() || viewport.getViewArea().getY() > beat.getY()))
         {
             viewport.setViewPosition (0, beat.getY());
@@ -265,7 +275,7 @@ void PerformView::BeatView::paint (juce::Graphics& g)
     if (isCurrent | hasDraggedItem)
     {
         g.setColour (gainedColour);
-        g.fillRoundedRectangle (0, bounds.getY(), getWidth() * relativePos, bounds.getHeight(), cornerSize);
+        g.fillRoundedRectangle (0.0f, bounds.getY(), bounds.getWidth() * relativePos, bounds.getHeight(), cornerSize);
         g.setColour (juce::Colours::white.withAlpha (0.5f));
         g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (1.0f), cornerSize, cornerSize);
     }
@@ -426,7 +436,7 @@ void PerformView::TopBar::resized()
     const auto bpmWidth = tempo.getFont().getStringWidth ("999.99") + 10;
     tempo.setBounds (area.removeFromLeft (bpmWidth));
     auto signatureArea = area.removeFromRight (bpmWidth);
-    auto sigWidth = juce::roundToInt (bpmWidth * 0.5);
+    auto sigWidth = bpmWidth / 2;
     num.setBounds (signatureArea.removeFromLeft (sigWidth));
     denum.setBounds (signatureArea.removeFromRight (sigWidth));
     sigDivider.setBounds (signatureArea.expanded (30, 0));
