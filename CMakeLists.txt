@@ -24,7 +24,7 @@ set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Tick installer")
 
 if(WIN32)
     set(CPACK_NSIS_INSTALL_ROOT "$PROGRAMFILES64\\\\Common Files")
-    set(CPACK_PACKAGE_INSTALL_DIRECTORY "VST3")
+    set(CPACK_PACKAGE_INSTALL_DIRECTORY "VST3\\\\TICK Live Automation")
 endif()
 
 include(CPack)
