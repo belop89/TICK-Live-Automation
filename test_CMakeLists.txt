@@ -1,0 +1,42 @@
+# test_CMakeLists.txt
+
+cmake_minimum_required(VERSION 3.22.1)
+project(TICK_Tests)
+
+enable_testing()
+
+# Example: Add a test executable for PluginProcessor
+add_executable(test_PluginProcessor
+    Source/PluginProcessor.cpp
+    Source/PluginProcessor.h
+    tests/test_PluginProcessor.cpp
+)
+
+target_link_libraries(test_PluginProcessor PRIVATE TICK)
+
+add_test(NAME PluginProcessorTest COMMAND test_PluginProcessor)
+
+# Example: Add a test executable for PluginEditor
+add_executable(test_PluginEditor
+    Source/PluginEditor.cpp
+    Source/PluginEditor.h
+    tests/test_PluginEditor.cpp
+)
+
+target_link_libraries(test_PluginEditor PRIVATE TICK)
+
+add_test(NAME PluginEditorTest COMMAND test_PluginEditor)
+
+# Repeat for other components as needed
+# Example for UtilityFunctions
+add_executable(test_UtilityFunctions
+    Source/utils/UtilityFunctions.cpp
+    Source/utils/UtilityFunctions.h
+    tests/test_UtilityFunctions.cpp
+)
+
+target_link_libraries(test_UtilityFunctions PRIVATE TICK)
+
+add_test(NAME UtilityFunctionsTest COMMAND test_UtilityFunctions)
+
+# Note: You need to create the corresponding test_*.cpp files in a 'tests' directory.

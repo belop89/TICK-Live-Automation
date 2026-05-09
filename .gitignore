@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__
+/Builds
+/build
+/build-ios
+/Installer/build
+/Installer/Output
+/JuceLibraryCode
+# things not to commit (not open-sourced / eg - signing AAX)
+/.vs
+/out
+/private
+/result
+# auto-generated each build
+Source/utils/gitversion.h
