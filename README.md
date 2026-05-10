@@ -9,8 +9,8 @@ While the original TICK is a fantastic, cross-platform, sample-accurate metronom
 ### 1. SongBook / Setlist App Integration (No-Math BPM routing)
 To bypass the strict 127 maximum value limit of the MIDI protocol without requiring the user to do complex math in their setlist app, this version uses a smart multi-channel Program Change (PC) system to set the BPM directly:
 * **MIDI Channel 10:** PC values 1-99 set the BPM directly to 1-99.
-* **MIDI Channel 11:** Adds 99 to the PC value (e.g., PC 1 = 100 BPM, PC 100 = 199 BPM).
-* **MIDI Channel 12:** Adds 199 to the PC value (e.g., PC 1 = 200 BPM, PC 100 = 299 BPM).
+* **MIDI Channel 11:** Adds 100 to the PC value (e.g., PC 70 = 170 BPM).
+* **MIDI Channel 12:** Adds 200 to the PC value (e.g., PC 70 = 270 BPM).
 *(Channel 16 is completely ignored by the metronome, allowing it to be used exclusively for lighting/video cues).*
 
 ### 2. Jitter-Free MIDI Beat Clock Generator
