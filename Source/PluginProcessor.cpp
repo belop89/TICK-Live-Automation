@@ -232,7 +232,10 @@ void TickAudioProcessor::handlePreCount (const double inputPPQ)
     const auto ttq = (4.0 / juce::jmax(1, ts.denominator)); // tick to quarter (säkerhetsspärr)
     const auto expectedBar = std::floor (inputPPQ / ttq / juce::jmax(1, ts.numerator)); // Säkerhetsspärr
     if ((int)expectedBar == preCount)
-        getState().transport.isPlaying.setValue (false, nullptr);
+    {
+        uiIsPlaying.store(0, std::memory_order_relaxed);
+        triggerAsyncUpdate();
+    }
 }
 
 // NOTE: named midiMessages to allow MIDI inspection
@@ -278,9 +281,10 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
 
                 if (newBpm > 0.0)
                 {
-                    settings.useHostTransport.setValue(false, nullptr);
-                    settings.transport.bpm.setValue((float)newBpm, nullptr);
-                    settings.transport.isPlaying.setValue(true, nullptr);
+                    uiUseHost.store(0, std::memory_order_relaxed);
+                    uiBpm.store((float)newBpm, std::memory_order_relaxed);
+                    uiIsPlaying.store(1, std::memory_order_relaxed);
+                    triggerAsyncUpdate();
                     forceSongRestart = true;
                 }
             }
@@ -346,7 +350,9 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     }
 
     // standalone mode
-    if (! isHostSyncSupported() || ! getState().useHostTransport.get())
+    // Läs in aktuellt state, och applicera UI-brevlådan DIREKT för noll latens om den har nytt data!
+    const bool isUseHost = uiUseHost.load(std::memory_order_relaxed) >= 0 ? uiUseHost.load(std::memory_order_relaxed) == 1 : settings.useHostTransport.get();
+    if (! isHostSyncSupported() || ! isUseHost)
     {
 #if JUCE_IOS
         AbletonLink::Requests requests;
@@ -357,9 +363,14 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
             requests.bpm = settings.transport.bpm.get();
 #endif
 
-        playheadPosition_.setIsPlaying (settings.transport.isPlaying.get());
-        playheadPosition_.setTimeSignature(AudioPlayHead::TimeSignature ({(int)settings.transport.numerator.get(), (int)settings.transport.denumerator.get()}));
-        playheadPosition_.setBpm (settings.transport.bpm.get());
+        const bool isPlayingState = uiIsPlaying.load(std::memory_order_relaxed) >= 0 ? (uiIsPlaying.load(std::memory_order_relaxed) == 1) : static_cast<bool>(settings.transport.isPlaying.get());
+        const int numState = uiNumerator.load(std::memory_order_relaxed) >= 0 ? uiNumerator.load(std::memory_order_relaxed) : static_cast<int>(settings.transport.numerator.get());
+        const int denumState = uiDenominator.load(std::memory_order_relaxed) >= 0 ? uiDenominator.load(std::memory_order_relaxed) : static_cast<int>(settings.transport.denumerator.get());
+        const float bpmState = uiBpm.load(std::memory_order_relaxed) >= 0.0f ? uiBpm.load(std::memory_order_relaxed) : static_cast<float>(settings.transport.bpm.get());
+
+        playheadPosition_.setIsPlaying (isPlayingState);
+        playheadPosition_.setTimeSignature(AudioPlayHead::TimeSignature ({numState, denumState}));
+        playheadPosition_.setBpm (bpmState);
         if (! playheadPosition_.getIsPlaying())
         {
             playheadPosition_.setPpqPosition({});
@@ -373,7 +384,8 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         if (m_link.isLinkConnected())
         {
             m_link.linkPosition (playheadPosition_, requests);
-            settings.transport.isPlaying.setValue (playheadPosition_.getIsPlaying(), nullptr);
+            uiIsPlaying.store(playheadPosition_.getIsPlaying() ? 1 : 0, std::memory_order_relaxed);
+            triggerAsyncUpdate();
         }
 #endif
     }
@@ -382,14 +394,32 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         playheadPosition_ = getPlayHead()->getPosition().orFallback(AudioPlayHead::PositionInfo());
     }
 
-    // setValue only triggers if value is different
+    // DSP-Optimering & GUI-Fix: Uppdatera bara ValueTree om värdet har ändrats markant.
+    // Att anropa setValue med mikroskopiska flyttalsvariationer varje ljudblock får JUCE att 
+    // spamma UI-tråden med uppdateringar, vilket triggar Windows Accessibility (UIA) att stjäla 
+    // fönsterfokus så att Cubase-menyerna stängs ner!
     if (playheadPosition_.getBpm().hasValue())
-        settings.transport.bpm.setValue ((float) *playheadPosition_.getBpm(), nullptr);
+    {
+        const float newBpm = (float) *playheadPosition_.getBpm();
+        if (std::abs(settings.transport.bpm.get() - newBpm) > 0.01f)
+        {
+            uiBpm.store(newBpm, std::memory_order_relaxed);
+            triggerAsyncUpdate();
+        }
+    }
     if (playheadPosition_.getTimeSignature().hasValue())
     {
         const auto ts = *playheadPosition_.getTimeSignature();
-        settings.transport.numerator.setValue (ts.numerator, nullptr);
-        settings.transport.denumerator.setValue (ts.denominator, nullptr);
+        if (settings.transport.numerator.get() != ts.numerator)
+        {
+            uiNumerator.store(ts.numerator, std::memory_order_relaxed);
+            triggerAsyncUpdate();
+        }
+        if (settings.transport.denumerator.get() != ts.denominator)
+        {
+            uiDenominator.store(ts.denominator, std::memory_order_relaxed);
+            triggerAsyncUpdate();
+        }
     }
 
     // --- NY FUNKTION: MIDI Beat Clock Out (Jitter-free) ---
@@ -464,7 +494,8 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         {
         const auto ppqPosition = playheadPosition_.getPpqPosition().orFallback(0);
         const auto lastBarStart = playheadPosition_.getPpqPositionOfLastBarStart().orFallback(0);
-        const auto bpm = playheadPosition_.getBpm().orFallback(120.0f);
+        // Säkerhet: Förhindra Infinity-krasch (Division by Zero) om DAW-automationen slår ner i 0 BPM!
+        const auto bpm = juce::jmax(0.001f, (float)playheadPosition_.getBpm().orFallback(120.0f));
         const auto ts = playheadPosition_.getTimeSignature().orFallback(AudioPlayHead::TimeSignature ({1, 4}));
         
         // calculate where tick starts in samples...
@@ -704,9 +735,10 @@ bool TickAudioProcessor::handleTapTempo(uint32_t nowMs)
 
     if (newBPM > 0.0)
     {
-        settings.useHostTransport.setValue(false, nullptr);
-        settings.transport.bpm.setValue((float)newBPM, nullptr);
-        settings.transport.isPlaying.setValue(true, nullptr);
+        uiUseHost.store(0, std::memory_order_relaxed);
+        uiBpm.store((float)newBPM, std::memory_order_relaxed);
+        uiIsPlaying.store(1, std::memory_order_relaxed);
+        triggerAsyncUpdate();
         return true;
     }
     return false;
@@ -717,6 +749,22 @@ void TickAudioProcessor::handleAsyncUpdate()
     // Körs på Message-tråden – kraschar inte och pausar inte ljudet!
     if (tapTempoParam)
         tapTempoParam->setValueNotifyingHost (0.0f);
+        
+    // Töm den trådsäkra brevlådan till ValueTree säkert via UI-tråden!
+    float b = uiBpm.exchange(-1.0f, std::memory_order_relaxed);
+    if (b >= 0.0f) settings.transport.bpm.setValue(b, nullptr);
+    
+    int n = uiNumerator.exchange(-1, std::memory_order_relaxed);
+    if (n >= 0) settings.transport.numerator.setValue(n, nullptr);
+    
+    int d = uiDenominator.exchange(-1, std::memory_order_relaxed);
+    if (d >= 0) settings.transport.denumerator.setValue(d, nullptr);
+    
+    int p = uiIsPlaying.exchange(-1, std::memory_order_relaxed);
+    if (p >= 0) settings.transport.isPlaying.setValue(p == 1, nullptr);
+    
+    int h = uiUseHost.exchange(-1, std::memory_order_relaxed);
+    if (h >= 0) settings.useHostTransport.setValue(h == 1, nullptr);
 }
 
 AudioProcessor* JUCE_CALLTYPE createPluginFilter()

@@ -62,13 +62,14 @@ EditBeatView::EditBeatView (TickSettings& stateRef, TicksHolder& ticksRef)
     beatScrollForward.setTitle ("Next Sample");
     beatScrollBack.onClick = [this] {
         jassert (selection.size() > 0);
-        const auto availableBeats = state.transport.numerator.get();
+        const auto availableBeats = juce::jlimit(1, (int)TickSettings::kMaxBeatAssignments, state.transport.numerator.get());
         const auto idx = selection.front() - 1;
         updateSelection ({ (idx >= 0 ? idx : (int) (availableBeats - 1)) % availableBeats });
     };
     beatScrollForward.onClick = [this] {
         jassert (selection.size() > 0);
-        updateSelection ({ (selection.front() + 1) % state.transport.numerator.get() });
+        const auto availableBeats = juce::jlimit(1, (int)TickSettings::kMaxBeatAssignments, state.transport.numerator.get());
+        updateSelection ({ (selection.front() + 1) % availableBeats });
     };
 
     addChildComponent (beatScrollBack);
@@ -235,9 +236,14 @@ void EditBeatView::SamplesModel::SampleOption::paint (juce::Graphics& g)
         return;
 
     {
-        auto img = Drawable::createFromImageData (BinaryData::more_vert24px_svg, BinaryData::more_vert24px_svgSize);
-        img->replaceColour (Colours::black, Colours::white);
-        img->drawWithin (g, getLocalBounds().removeFromRight (getHeight()).reduced (10).toFloat(), RectanglePlacement::centred, 1.0f);
+        // GUI-Optimering: Ladda SVG-ikonen en enda gång i minnet istället för varje bildruta!
+        static std::unique_ptr<juce::Drawable> img = [] {
+            auto d = juce::Drawable::createFromImageData (BinaryData::more_vert24px_svg, BinaryData::more_vert24px_svgSize);
+            d->replaceColour (juce::Colours::black, juce::Colours::white);
+            return d;
+        }();
+        if (img != nullptr)
+            img->drawWithin (g, getLocalBounds().removeFromRight (getHeight()).reduced (10).toFloat(), RectanglePlacement::centred, 1.0f);
     }
 }
 
@@ -251,42 +257,45 @@ void EditBeatView::SamplesModel::SampleOption::mouseDown (const juce::MouseEvent
         menu.addSeparator();
         menu.addItem (4, "Set sample to this beat and onward...");
         auto options = juce::PopupMenu::Options().withParentComponent (owner.getParentComponent()).withTargetScreenArea (getScreenBounds().removeFromRight (getHeight()));
-        menu.showMenuAsync (options, [this] (int value) {
+        menu.showMenuAsync (options, [safeThis = juce::Component::SafePointer<SampleOption>(this)] (int value) {
+            if (safeThis == nullptr) return;
             switch (value)
             {
                 case 1:
-                    owner.state.view.showEditSamples = true;
+                    safeThis->owner.state.view.showEditSamples = true;
                     break;
                 case 2:
                 {
                     // TODO: DRY with code below for adding new samples
-                    auto addSamplesMenu = owner.getAddSamplesMenu (row);
-                    owner.listboxMenu.reset (new jux::ListBoxMenu());
-                    owner.listboxMenu->setRowHeight (50);
-                    owner.listboxMenu->setMenuFromPopup (std::move (addSamplesMenu));
-                    owner.listboxMenu->setShouldCloseOnItemClick (true);
-                    owner.getParentComponent()->addAndMakeVisible (owner.listboxMenu.get());
-                    owner.listboxMenu->setBounds (owner.getParentComponent()->getLocalBounds());
-                    owner.listboxMenu->setOnRootBackToParent ([this]() {
-                        owner.getParentComponent()->removeChildComponent (owner.listboxMenu.get());
+                    auto addSamplesMenu = safeThis->owner.getAddSamplesMenu (safeThis->row);
+                    safeThis->owner.listboxMenu.reset (new jux::ListBoxMenu());
+                    safeThis->owner.listboxMenu->setRowHeight (50);
+                    safeThis->owner.listboxMenu->setMenuFromPopup (std::move (addSamplesMenu));
+                    safeThis->owner.listboxMenu->setShouldCloseOnItemClick (true);
+                    safeThis->owner.getParentComponent()->addAndMakeVisible (safeThis->owner.listboxMenu.get());
+                    safeThis->owner.listboxMenu->setBounds (safeThis->owner.getParentComponent()->getLocalBounds());
+                    safeThis->owner.listboxMenu->toFront (true);
+                    safeThis->owner.listboxMenu->setOnRootBackToParent ([safeThis]() {
+                        if (safeThis != nullptr) safeThis->owner.getParentComponent()->removeChildComponent (safeThis->owner.listboxMenu.get());
                     });
-                    owner.getParentComponent()->addAndMakeVisible (owner.listboxMenu.get());
-                    owner.listboxMenu->setBounds (owner.getParentComponent()->getLocalBounds());
-                    owner.listboxMenu->setAlwaysOnTop (true);
                 }
                 break;
                 case 3:
                 {
-                    auto& assignment = owner.state.beatAssignments[owner.selection.front()];
-                    assignment.tickIdx.setValue (std::max (0, assignment.tickIdx.get() - 1), nullptr);
-                    owner.ticks.removeTick (row);
+                    if (! safeThis->owner.selection.empty())
+                    {
+                        auto& assignment = safeThis->owner.state.beatAssignments[safeThis->owner.selection.front()];
+                        assignment.tickIdx.setValue (std::max (0, assignment.tickIdx.get() - 1), nullptr);
+                        safeThis->owner.ticks.removeTick (safeThis->row);
+                    }
                     break;
                 }
                 case 4:
                 {
-                    const auto currentSelection = owner.selection[0];
+                    const auto currentSelection = safeThis->owner.selection[0];
                     for (auto i = currentSelection; i < TickSettings::kMaxBeatAssignments; ++i)
-                        owner.state.beatAssignments[i].tickIdx = row;
+                        safeThis->owner.state.beatAssignments[i].tickIdx = safeThis->row;
+                    break;
                 }
                 default:
                     break;
@@ -306,19 +315,25 @@ juce::PopupMenu EditBeatView::getAddSamplesMenu (const int replaceIndex)
     {
         auto& item = *factorySamples->getEntry (i);
         String sampleName (item.filename.substring (0, item.filename.length() - 4));
-        menu.addItem (sampleName, [this, item, sampleName, replaceIndex] {
+        menu.addItem (sampleName, [safeThis = juce::Component::SafePointer<EditBeatView>(this), sampleName, replaceIndex] {
+            if (safeThis == nullptr) return;
             auto samples = TickUtils::getFactorySamples();
             auto* entry = samples->getEntry (sampleName + ".wav");
-            auto newTick = std::unique_ptr<Tick> (ticks.importAudioStream (sampleName, std::unique_ptr<InputStream> (samples->createStreamForEntry (*entry))));
-            setNewImportedSample (replaceIndex, std::move (newTick));
-            removeChildComponent (listboxMenu.get());
+        if (entry != nullptr)
+        {
+            auto newTick = std::unique_ptr<Tick> (safeThis->ticks.importAudioStream (sampleName, std::unique_ptr<InputStream> (samples->createStreamForEntry (*entry))));
+            safeThis->setNewImportedSample (replaceIndex, std::move (newTick));
+        }
         });
     }
     menu.addSeparator();
-    menu.addItem ("Import Audio File...", TickUtils::canImport(), false, [this, replaceIndex]()
-                  { fileChooser.launchAsync (FileBrowserComponent::FileChooserFlags::openMode | FileBrowserComponent::FileChooserFlags::canSelectFiles,
-                                             [this, replaceIndex] (const FileChooser& chooser)
+    menu.addItem ("Import Audio File...", TickUtils::canImport(), false, [safeThis = juce::Component::SafePointer<EditBeatView>(this), replaceIndex]()
+                  { 
+                      if (safeThis == nullptr) return;
+                      safeThis->fileChooser.launchAsync (FileBrowserComponent::FileChooserFlags::openMode | FileBrowserComponent::FileChooserFlags::canSelectFiles,
+                                             [safeThis, replaceIndex] (const FileChooser& chooser)
                                              {
+                                                 if (safeThis == nullptr) return;
 #if JUCE_ANDROID
                                                  if (! chooser.getURLResult().isEmpty())
 #else
@@ -327,13 +342,13 @@ juce::PopupMenu EditBeatView::getAddSamplesMenu (const int replaceIndex)
                                                  {
 #if JUCE_IOS || JUCE_ANDROID
                                                      auto newTick = std::unique_ptr<Tick> (
-                                                         ticks.importURL (chooser.getURLResult()));
+                                                         safeThis->ticks.importURL (chooser.getURLResult()));
 #else
-                                                                                                        auto newTick = std::unique_ptr<Tick> (ticks.importAudioFile (chooser.getResult()));
+                                                                                                        auto newTick = std::unique_ptr<Tick> (safeThis->ticks.importAudioFile (chooser.getResult()));
 #endif
-                                                     setNewImportedSample (replaceIndex, std::move (newTick));
+                                                     safeThis->setNewImportedSample (replaceIndex, std::move (newTick));
                                                  }
-                                                 getTopLevelComponent()->repaint();
+                                                 safeThis->getTopLevelComponent()->repaint();
                                              }); });
     return menu;
 }
@@ -348,7 +363,8 @@ void EditBeatView::setNewImportedSample (const int replaceIndex, std::unique_ptr
     }
     else
         ticks.replaceTick (replaceIndex, std::move (newTick));
-    removeChildComponent (listboxMenu.get());
+    if (listboxMenu != nullptr && getParentComponent() != nullptr)
+        getParentComponent()->removeChildComponent (listboxMenu.get());
 }
 
 bool EditBeatView::SamplesModel::SampleOption::hitTest (int x, int /*y*/)
@@ -376,16 +392,14 @@ void EditBeatView::SamplesModel::listBoxItemClicked (int row, const juce::MouseE
         owner.updateSelection (owner.selection);
         auto menu = owner.getAddSamplesMenu();
         owner.listboxMenu.reset (new jux::ListBoxMenu());
-        owner.listboxMenu->setAlwaysOnTop (true);
         owner.listboxMenu->setShouldCloseOnItemClick (true);
         owner.listboxMenu->setRowHeight (50);
         owner.listboxMenu->setMenuFromPopup (std::move (menu));
-        owner.addAndMakeVisible (owner.listboxMenu.get());
-        owner.listboxMenu->setBounds (owner.getLocalBounds());
-        owner.listboxMenu->setOnRootBackToParent ([this]() {
-            owner.getParentComponent()->removeChildComponent (owner.listboxMenu.get());
+        owner.listboxMenu->setOnRootBackToParent ([safeOwner = juce::Component::SafePointer<EditBeatView>(&owner)]() {
+            if (safeOwner != nullptr) safeOwner->getParentComponent()->removeChildComponent (safeOwner->listboxMenu.get());
         });
         owner.getParentComponent()->addAndMakeVisible (owner.listboxMenu.get());
         owner.listboxMenu->setBounds (owner.getParentComponent()->getLocalBounds());
+        owner.listboxMenu->toFront (true);
     }
 }

@@ -13,6 +13,7 @@
 
 #include "EditBeatView.h"
 #include "utils/SamplesPaint.h"
+#include "../PluginProcessor.h"
 
 PerformView::PerformView (TickSettings& stateToLink, TicksHolder& ticksToLink, SamplesPaint& paint)
     : state (stateToLink), ticks (ticksToLink), samplesPaint (paint), editView (std::make_unique<EditBeatView> (state, ticks))
@@ -62,7 +63,6 @@ PerformView::PerformView (TickSettings& stateToLink, TicksHolder& ticksToLink, S
     topBar.num.addMouseListener (this, true);
     topBar.denum.addMouseListener (this, true);
 
-    editView->setAlwaysOnTop (true);
     addChildComponent (editView.get());
 
     juce::Desktop::getInstance().getAnimator().addChangeListener (this);
@@ -102,7 +102,8 @@ void PerformView::resized()
     topBar.setBounds (area.removeFromTop (TickLookAndFeel::barHeight));
     if (isEditMode && editView->isVisible())
     {
-        juce::Rectangle<int> showing (0, getBottom() - editViewHeight, getWidth(), editViewHeight);
+        // FIX: Använd getHeight() istället för getBottom() för korrekta lokala koordinater!
+        juce::Rectangle<int> showing (0, getHeight() - editViewHeight, getWidth(), editViewHeight);
         if (! isAnimatingEditView.load())
             editView->setBounds (showing);
         area.removeFromBottom (editViewHeight);
@@ -137,7 +138,8 @@ void PerformView::resized()
 
 void PerformView::update (double currentPos)
 {
-    const auto numOfBeats = state.transport.numerator.get();
+    // Säkerhetsspärr: Förhindra Memory Access Violation om DAW:en skickar extrema taktartsvärden (>64)
+    const auto numOfBeats = juce::jlimit(1, (int)TickSettings::kMaxBeatAssignments, state.transport.numerator.get());
     const auto denumrator = state.transport.denumerator.get();
     if ((size_t) numOfBeats != beats.size() || beatsInRow != denumrator)
     {
@@ -172,12 +174,18 @@ void PerformView::update (double currentPos)
         }
     }
     const bool isStandalone = ! state.useHostTransport.get();
-    topBar.tempo.setDescription (juce::String (state.transport.bpm.get()) + "BPM");
-    topBar.num.setDescription (juce::String (state.transport.numerator.get()) + " beats numerator");
-    topBar.denum.setDescription (juce::String (state.transport.denumerator.get()) + " beats denumerator");
-    topBar.tempo.setEnabled (isStandalone);
-    topBar.num.setEnabled (isStandalone);
-    topBar.denum.setEnabled (isStandalone);
+    
+    // GUI-Optimering: Jämför värden lokalt för att helt undvika att allokera strängar
+    // (som juce::String) 50 gånger i sekunden!
+    if (topBar.tempo.isEnabled() != isStandalone || std::abs(state.transport.bpm.get() - topBar.tempo.getText().getFloatValue()) > 0.01f)
+    {
+        topBar.tempo.setDescription (juce::String (state.transport.bpm.get()) + "BPM");
+        topBar.num.setDescription (juce::String (state.transport.numerator.get()) + " beats numerator");
+        topBar.denum.setDescription (juce::String (state.transport.denumerator.get()) + " beats denumerator");
+        topBar.tempo.setEnabled (isStandalone);
+        topBar.num.setEnabled (isStandalone);
+        topBar.denum.setEnabled (isStandalone);
+    }
 }
 
 void PerformView::setEditMode (const bool newMode)
@@ -195,10 +203,12 @@ void PerformView::setEditMode (const bool newMode)
         beat->setEnabled (isEditMode);
     }
     editView->updateSelection ({ 0 });
-    editView->setVisible (isEditMode);
+    // FIX: Se till att menyn alltid ritas under animationen och ligger överst (Z-order)
+    editView->setVisible (true);
+    editView->toFront (false);
     const auto height = getEditViewHeight();
-    juce::Rectangle<int> hidden (0, getBottom(), getWidth(), height);
-    juce::Rectangle<int> showing (0, getBottom() - height, getWidth(), height);
+    juce::Rectangle<int> hidden (0, getHeight(), getWidth(), height);
+    juce::Rectangle<int> showing (0, getHeight() - height, getWidth(), height);
     editView->setBounds (isEditMode ? hidden : showing);
     isAnimatingEditView = true;
     resized();
@@ -267,12 +277,12 @@ void PerformView::BeatView::paint (juce::Graphics& g)
     g.setColour (juce::Colours::black.withAlpha (0.3f));
     g.fillRoundedRectangle (bounds, cornerSize);
 
-    if (isOn | hasDraggedItem)
+    if (isOn || hasDraggedItem)
     {
         g.setColour (gainedColour);
         g.fillRoundedRectangle (bounds, cornerSize);
     }
-    if (isCurrent | hasDraggedItem)
+    if (isCurrent || hasDraggedItem)
     {
         g.setColour (gainedColour);
         g.fillRoundedRectangle (0.0f, bounds.getY(), bounds.getWidth() * relativePos, bounds.getHeight(), cornerSize);
@@ -310,9 +320,15 @@ void PerformView::mouseDown (const juce::MouseEvent& e)
     if (e.originalComponent == &topBar.tapMode)
     {
         topBar.tapMode.setColour (juce::Label::backgroundColourId, TickLookAndFeel::Colours::wood);
-        tapModel.pushTap (juce::Time::getMillisecondCounter());
-        if (tapModel.getLastDetectedBPM() > 0)
-            state.transport.bpm.setValue ((float) tapModel.getLastDetectedBPM(), nullptr);
+        
+        // GUI-Optimering: Trigga den globala DSP-parametern direkt istället för att beräkna 
+        // tempot lokalt. Detta ger oss fas-alignering och samma debounce som MIDI-pedalen!
+        if (auto* editor = findParentComponentOfClass<juce::AudioProcessorEditor>())
+        {
+            if (auto* proc = dynamic_cast<TickAudioProcessor*>(editor->getAudioProcessor()))
+                if (auto* param = proc->getAPVTS().getParameter (TickAudioProcessor::kTapTempoButtonID))
+                    param->setValueNotifyingHost (1.0f);
+        }
         return;
     }
 
@@ -391,7 +407,6 @@ static void setupSigLabel (juce::Label& l)
 
 PerformView::TopBar::TopBar()
 {
-    setFocusContainerType (FocusContainerType::focusContainer);
     setInterceptsMouseClicks (false, true);
     tempoLabel.setText ("BPM", juce::dontSendNotification);
     tempoLabel.setFont (juce::Font (30.0));
@@ -447,7 +462,9 @@ void PerformView::TopBar::resized()
 
 void PerformView::changeListenerCallback (juce::ChangeBroadcaster*)
 {
-    if (! juce::Desktop::getInstance().getAnimator().isAnimating (editView.get()) && getParentComponent())
+    // FIX: Trigga bara layout-förändringar (resized) om menyn FAKTISKT höll på att animeras.
+    // Detta förhindrar att pluginen stjäl fönsterfokus från DAW:ens "File"-menyer!
+    if (isAnimatingEditView.load() && ! juce::Desktop::getInstance().getAnimator().isAnimating (editView.get()) && getParentComponent())
     {
         isAnimatingEditView = false;
         editView->setVisible (isEditMode);

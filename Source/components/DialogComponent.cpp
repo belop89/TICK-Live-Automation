@@ -16,7 +16,6 @@ DialogComponent::DialogComponent (const String& title, const String& message, Co
     : justification (Justification::centred), associatedComponent (associatedComp)
 {
     setName (title);
-    setAlwaysOnTop (true);
     if (message.isEmpty())
         text = " "; // to force an update if the message is empty
     updateLayout();
@@ -178,8 +177,9 @@ void DialogComponent::updateLayout()
     auto wid = jmax (messageFont.getStringWidth (text),
                      messageFont.getStringWidth (getName()));
 
+    const int refWidth = getParentComponent() != nullptr ? getParentWidth() : (associatedComponent != nullptr ? associatedComponent->getWidth() : 800);
     auto sw = (int) std::sqrt (messageFont.getHeight() * wid);
-    auto w = jmin (300 + sw * 2, (int) (getParentWidth() * 0.7f));
+    auto w = jmin (300 + sw * 2, (int) (refWidth * 0.7f));
     const int edgeGap = 10;
     const int labelHeight = 18;
     int iconSpace = 0;
@@ -198,7 +198,7 @@ void DialogComponent::updateLayout()
     }
 
     w = jmax (350, (int) textLayout.getWidth() + iconSpace + edgeGap * 4);
-    w = jmin (w, (int) (getParentWidth() * 0.7f));
+    w = jmin (w, (int) (refWidth * 0.7f));
 
     auto textLayoutH = (int) textLayout.getHeight();
     auto textBottom = 16 + titleH + textLayoutH;
@@ -232,7 +232,7 @@ void DialogComponent::updateLayout()
             h += labelHeight;
     }
 
-    w = jmin (w, (int) (getParentWidth() * 0.7f));
+    w = jmin (w, (int) (refWidth * 0.7f));
 
     setBounds (getBounds().withHeight (h));
 
@@ -296,8 +296,8 @@ bool DialogComponent::containsAnyExtraComponents() const
 void DialogComponent::showOkCancelDialog (
     const String& title,
     const String& message,
-    const String& /*button1Text*/,
-    const String& /*button2Text*/,
+    const String& button1Text,
+    const String& button2Text,
     Component* associatedComponent,
     ModalComponentManager::Callback* callback)
 {
@@ -305,14 +305,15 @@ void DialogComponent::showOkCancelDialog (
     auto* aw = new DialogComponent (title,
                                     message,
                                     associatedComponent);
-    aw->addButton (TRANS ("Ok"), 1, KeyPress (KeyPress::returnKey));
-    aw->addButton (TRANS ("Cancel"), 0, KeyPress (KeyPress::escapeKey));
+    aw->addButton (button1Text.isEmpty() ? TRANS ("Ok") : button1Text, 1, KeyPress (KeyPress::returnKey));
+    aw->addButton (button2Text.isEmpty() ? TRANS ("Cancel") : button2Text, 0, KeyPress (KeyPress::escapeKey));
     const auto dialogHeight = jmin (350, roundToInt (associatedComponent->getHeight() * 0.3));
     Rectangle<int> bounds = { 0, 0, roundToInt (associatedComponent->getWidth() * 0.8), dialogHeight };
 
     Justification justification (Justification::centredTop);
     aw->setBounds (justification.appliedToRectangle (bounds, associatedComponent->getLocalBounds()));
     associatedComponent->addAndMakeVisible (aw);
+    aw->toFront (true); // FIX: Säkerställ att rutan alltid hamnar överst oavsett Z-order-bråk
 
     aw->enterModalState (true, callback, true);
 }

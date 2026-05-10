@@ -129,39 +129,44 @@ PresetsView::PresetsView (TickSettings& stateRef, TicksHolder& ticksRef)
             PopupMenu menu;
             if (isRoot())
             {
-                menu.addItem ("New Set", [this] {
-                    createFolder();
+            menu.addItem ("New Set", [safeThis = juce::Component::SafePointer<PresetsView>(this)] {
+                if (safeThis != nullptr) safeThis->createFolder();
                 });
             }
-            menu.addItem ("Create Empty Preset", [this] {
-                state.clear();
+        menu.addItem ("Create Empty Preset", [safeThis = juce::Component::SafePointer<PresetsView>(this)] {
+            if (safeThis != nullptr) safeThis->state.clear();
             });
-            menu.addItem ("Save as...", [this] {
-                const auto fileToSave = directoryContents->getDirectory().getChildFile (state.presetName.get() + TickUtils::kPresetExtension);
-                auto* aw = new DialogComponent ("Save Preset",
-                                                juce::String(),
-                                                this);
-                aw->addTextEditor ("PresetNameInput", fileToSave.getFileNameWithoutExtension(), juce::String(), false);
-                aw->addToggle ("keepTransport", "Include Tempo & Meter Data", ! state.useHostTransport.get());
+        menu.addItem ("Save as...", [safeThis = juce::Component::SafePointer<PresetsView>(this)] {
+            if (safeThis == nullptr) return;
+            const auto fileToSave = safeThis->directoryContents->getDirectory().getChildFile (safeThis->state.presetName.get() + TickUtils::kPresetExtension);
+            auto* aw = new DialogComponent ("Save Preset", juce::String(), safeThis.getComponent());
+            aw->addTextEditor ("PresetNameInput", fileToSave.getFileNameWithoutExtension(), juce::String(), false);
+            aw->addToggle ("keepTransport", "Include Tempo & Meter Data", ! safeThis->state.useHostTransport.get());
                 aw->addButton (TRANS ("Save"), 1, juce::KeyPress (juce::KeyPress::returnKey));
                 aw->addButton (TRANS ("Cancel"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
-                setDialogBounds (*aw, getLocalBounds());
-                addAndMakeVisible (aw);
-                juce::Timer::callAfterDelay (100, [=] {
-                    if (aw != nullptr)
+            safeThis->setDialogBounds (*aw, safeThis->getLocalBounds());
+            safeThis->addAndMakeVisible (aw);
+            juce::Timer::callAfterDelay (100, [safeThis, safeAw = juce::Component::SafePointer<DialogComponent>(aw)] {
+                    if (safeThis != nullptr && safeAw != nullptr)
                     {
-                        aw->enterModalState (true,
+                        safeAw->enterModalState (true,
                                              juce::ModalCallbackFunction::forComponent (savePresetCallback,
-                                                                                        this,
-                                                                                        juce::Component::SafePointer<DialogComponent> (aw)),
+                                                                                        safeThis.getComponent(),
+                                                                                        safeAw),
                                              true);
+                    }
+                    else if (safeAw != nullptr)
+                    {
+                        delete safeAw.getComponent(); // FIX: Förhindra minnesläcka!
                     }
                 });
             });
 #if JUCE_IOS || JUCE_ANDROID
-                menu.addItem ("Import...", TickUtils::canImport(), false, [this] {
-                    fileChooser.launchAsync (FileBrowserComponent::FileChooserFlags::openMode | FileBrowserComponent::FileChooserFlags::canSelectFiles,
-                                             [this] (const FileChooser& chooser) {
+                menu.addItem ("Import...", TickUtils::canImport(), false, [safeThis = juce::Component::SafePointer<PresetsView>(this)] {
+                    if (safeThis == nullptr) return;
+                    safeThis->fileChooser.launchAsync (FileBrowserComponent::FileChooserFlags::openMode | FileBrowserComponent::FileChooserFlags::canSelectFiles,
+                                             [safeThis] (const FileChooser& chooser) {
+                                                 if (safeThis == nullptr) return;
                                                  if (! chooser.getURLResult().isEmpty())
                                                  {
 #if JUCE_ANDROID
@@ -186,7 +191,7 @@ PresetsView::PresetsView (TickSettings& stateRef, TicksHolder& ticksRef)
                                                      }
                                                      if (TickUtils::isValidPreset (output.getFile(),
                                                                                    true))
-                                                         refresh();
+                                                         safeThis->refresh();
                                                      else
                                                          output.getFile().deleteFile();
                                                  }
@@ -323,14 +328,18 @@ void PresetsView::createFolder()
     aw->addButton (TRANS ("Cancel"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
     setDialogBounds (*aw, getLocalBounds());
     addAndMakeVisible (aw);
-    juce::Timer::callAfterDelay (100, [=] {
-        if (aw != nullptr)
+    juce::Timer::callAfterDelay (100, [safeThis = juce::Component::SafePointer<PresetsView>(this), safeAw = juce::Component::SafePointer<DialogComponent>(aw)] {
+        if (safeThis != nullptr && safeAw != nullptr)
         {
-            aw->enterModalState (true,
+            safeAw->enterModalState (true,
                                  juce::ModalCallbackFunction::forComponent (createFolderCallback,
-                                                                            this,
-                                                                            juce::Component::SafePointer<DialogComponent> (aw)),
+                                                                            safeThis.getComponent(),
+                                                                            safeAw),
                                  true);
+        }
+        else if (safeAw != nullptr)
+        {
+            delete safeAw.getComponent();
         }
     });
 }
@@ -350,14 +359,18 @@ void PresetsView::deleteFileWithConfirmation (juce::File file)
     aw->getProperties().set ("filename", file.getFullPathName());
     setDialogBounds (*aw, getLocalBounds());
     addAndMakeVisible (aw);
-    juce::Timer::callAfterDelay (100, [=] {
-        if (aw != nullptr)
+    juce::Timer::callAfterDelay (100, [safeThis = juce::Component::SafePointer<PresetsView>(this), safeAw = juce::Component::SafePointer<DialogComponent>(aw)] {
+        if (safeThis != nullptr && safeAw != nullptr)
         {
-            aw->enterModalState (true,
+            safeAw->enterModalState (true,
                                  juce::ModalCallbackFunction::forComponent (deleteFileCallback,
-                                                                            this,
-                                                                            juce::Component::SafePointer<DialogComponent> (aw)),
+                                                                            safeThis.getComponent(),
+                                                                            safeAw),
                                  true);
+        }
+        else if (safeAw != nullptr)
+        {
+            delete safeAw.getComponent();
         }
     });
 }
@@ -497,6 +510,12 @@ juce::Component* PresetsView::PresetModel::refreshComponentForRow (int rowNumber
         component->name.setText (data.name + time, juce::dontSendNotification);
         component->name.setDescription ((data.isFolder ? "Folder " : "Preset " + component->name.getText()));
         component->isReady = true;
+
+        // FIX: Sätt textfärgen direkt här när listan byggs, istället för i paint() via async calls!
+        const auto isCurrent = owner.state.presetHash == data.uuid;
+        const auto textColor = isRowSelected ? juce::Colours::black : isCurrent ? TickLookAndFeel::Colours::mint : juce::Colours::white;
+        component->name.setColour (juce::Label::textColourId, textColor);
+        component->name.setColour (juce::Label::textWhenEditingColourId, textColor);
     }
 
     return component;
@@ -505,10 +524,14 @@ juce::Component* PresetsView::PresetModel::refreshComponentForRow (int rowNumber
 PresetsView::PresetView::PresetView()
     : moreOptions ("More Options...", juce::DrawableButton::ImageFitted)
 {
-    setFocusContainerType (FocusContainerType::focusContainer);
-    auto more = juce::Drawable::createFromImageData (BinaryData::more_vert24px_svg, BinaryData::more_vert24px_svgSize);
-    auto moreInverted = more->createCopy();
-    more->replaceColour (juce::Colours::black, juce::Colours::white);
+    // GUI-Optimering: Parse:a menyns ikoner statiskt en gång istället för varje gång en rad ritas
+    static std::unique_ptr<juce::Drawable> more = [] {
+        auto d = juce::Drawable::createFromImageData (BinaryData::more_vert24px_svg, BinaryData::more_vert24px_svgSize);
+        d->replaceColour (juce::Colours::black, juce::Colours::white);
+        return d;
+    }();
+    static std::unique_ptr<juce::Drawable> moreInverted = juce::Drawable::createFromImageData (BinaryData::more_vert24px_svg, BinaryData::more_vert24px_svgSize);
+
     moreOptions.setColour (juce::DrawableButton::backgroundOnColourId, juce::Colours::transparentBlack);
     moreOptions.setImages (more.get(), nullptr, nullptr, nullptr, moreInverted.get());
     addAndMakeVisible (moreOptions);
@@ -519,44 +542,59 @@ PresetsView::PresetView::PresetView()
 
     moreOptions.onClick = [this] {
         juce::PopupMenu p;
-        auto editIcon = juce::Drawable::createFromImageData (BinaryData::edit24px_svg, BinaryData::edit24px_svgSize);
-        editIcon->replaceColour (juce::Colours::black, juce::Colours::white);
-        auto deleteIcon = juce::Drawable::createFromImageData (BinaryData::delete24px_svg, BinaryData::delete24px_svgSize);
-        deleteIcon->replaceColour (juce::Colours::black, juce::Colours::white);
-        auto shareIcon = juce::Drawable::createFromImageData (BinaryData::ios_share_black_24dp_svg, BinaryData::ios_share_black_24dp_svgSize);
-        shareIcon->replaceColour (juce::Colours::black, juce::Colours::white);
-        p.addItem (1, "Rename..", true, false, std::move (editIcon));
-        p.addItem (2, "Delete", true, false, std::move (deleteIcon));
+        static std::unique_ptr<juce::Drawable> editIcon = [] {
+            auto d = juce::Drawable::createFromImageData (BinaryData::edit24px_svg, BinaryData::edit24px_svgSize);
+            d->replaceColour (juce::Colours::black, juce::Colours::white);
+            return d;
+        }();
+        static std::unique_ptr<juce::Drawable> deleteIcon = [] {
+            auto d = juce::Drawable::createFromImageData (BinaryData::delete24px_svg, BinaryData::delete24px_svgSize);
+            d->replaceColour (juce::Colours::black, juce::Colours::white);
+            return d;
+        }();
+        static std::unique_ptr<juce::Drawable> shareIcon = [] {
+            auto d = juce::Drawable::createFromImageData (BinaryData::ios_share_black_24dp_svg, BinaryData::ios_share_black_24dp_svgSize);
+            d->replaceColour (juce::Colours::black, juce::Colours::white);
+            return d;
+        }();
+        
+        p.addItem (1, "Rename..", true, false, editIcon->createCopy());
+        p.addItem (2, "Delete", true, false, deleteIcon->createCopy());
         p.addSeparator();
 #if JUCE_IOS || JUCE_ANDROID
-        p.addItem (3, "Share", true, false, std::move (shareIcon));
+        p.addItem (3, "Share", true, false, shareIcon->createCopy());
 #endif
-        auto options = juce::PopupMenu::Options().withParentComponent (getParentComponent()->getParentComponent()->getParentComponent()).withTargetComponent (moreOptions);
-        p.showMenuAsync (options, [this] (int value) {
+        auto options = juce::PopupMenu::Options().withParentComponent (presetsView).withTargetComponent (moreOptions);
+        p.showMenuAsync (options, [safeThis = juce::Component::SafePointer<PresetView>(this)] (int value) {
+            if (safeThis == nullptr) return;
             switch (value)
             {
                 case 1:
-                    name.setText (name.getProperties().getWithDefault ("filename", ""), juce::dontSendNotification);
-                    name.showEditor();
-                    name.onEditorHide = [this]() {
-                        auto file = presetsView->getFileForIndex (index);
-                        if (name.getText() == file.getFileNameWithoutExtension())
+                    safeThis->name.setText (safeThis->name.getProperties().getWithDefault ("filename", ""), juce::dontSendNotification);
+                    safeThis->name.showEditor();
+                    safeThis->name.onEditorHide = [safeThis]() {
+                        if (safeThis == nullptr || safeThis->presetsView == nullptr) return;
+                        // Säkerhet: Förhindra krasch om preset-listan hunnit ändras externt!
+                        if (safeThis->presetsView->directoryContents == nullptr || safeThis->index >= safeThis->presetsView->directoryContents->getNumFiles()) return;
+                        auto file = safeThis->presetsView->getFileForIndex (safeThis->index);
+                        if (safeThis->name.getText() == file.getFileNameWithoutExtension())
                             return;
-                        presetsView->renamePreset (file, name.getText(), name.getProperties().getVarPointer ("time") == nullptr);
+                        safeThis->presetsView->renamePreset (file, safeThis->name.getText(), safeThis->name.getProperties().getVarPointer ("time") == nullptr);
                     };
                     break;
                 case 2:
-                    jassert (presetsView != nullptr);
-                    presetsView->deleteFileWithConfirmation (presetsView->getFileForIndex (index));
+                    if (safeThis->presetsView != nullptr)
+                        safeThis->presetsView->deleteFileWithConfirmation (safeThis->presetsView->getFileForIndex (safeThis->index));
                     break;
                 case 3:
 #if JUCE_IOS || JUCE_ANDROID
                 {
                     ScopedMessageBox messageBox = juce::ContentSharer::shareFilesScoped (
-                        { presetsView->getFileForIndex (index) }, [this] (bool, String)
-                        { presetsView->shareBox.close(); },
-                        getTopLevelComponent());
-                    presetsView->shareBox = std::move (messageBox);
+                        { safeThis->presetsView->getFileForIndex (safeThis->index) }, [safeThis] (bool, String)
+                        { if (safeThis != nullptr) safeThis->presetsView->shareBox.close(); },
+                        safeThis->getTopLevelComponent());
+                    if (safeThis->presetsView != nullptr)
+                        safeThis->presetsView->shareBox = std::move (messageBox);
                 }
 #endif
                     break;
@@ -611,7 +649,27 @@ void PresetsView::PresetView::paint (juce::Graphics& g)
     if (! isReady)
         return;
 
-    auto image = juce::Drawable::createFromImageData (data.isFolder ? BinaryData::folder_open24px_svg : BinaryData::metro_tick_icon_svg, data.isFolder ? BinaryData::folder_open24px_svgSize : BinaryData::metro_tick_icon_svgSize);
+    // SUPER-OPTIMERING: Skapa färg-kopiorna av ikonerna EN enda gång i minnet.
+    // Tar bort onödiga 'createCopy'-allokeringar (undviker minnesallokering per frame för varje rad!)
+    enum ColorState { Normal = 0, Current = 1, Selected = 2 };
+    static std::unique_ptr<juce::Drawable> icons[2][3];
+    static bool iconsLoaded = false;
+    if (!iconsLoaded)
+    {
+        auto loadIcon = [](const char* svgData, int size, juce::Colour color) {
+            auto d = juce::Drawable::createFromImageData(svgData, size);
+            if (d != nullptr) d->replaceColour(juce::Colours::black, color);
+            return d;
+        };
+        icons[0][Normal] = loadIcon(BinaryData::metro_tick_icon_svg, BinaryData::metro_tick_icon_svgSize, juce::Colours::white);
+        icons[0][Current] = loadIcon(BinaryData::metro_tick_icon_svg, BinaryData::metro_tick_icon_svgSize, TickLookAndFeel::Colours::mint);
+        icons[0][Selected] = loadIcon(BinaryData::metro_tick_icon_svg, BinaryData::metro_tick_icon_svgSize, juce::Colours::black);
+        
+        icons[1][Normal] = loadIcon(BinaryData::folder_open24px_svg, BinaryData::folder_open24px_svgSize, juce::Colours::white);
+        icons[1][Current] = loadIcon(BinaryData::folder_open24px_svg, BinaryData::folder_open24px_svgSize, TickLookAndFeel::Colours::mint);
+        icons[1][Selected] = loadIcon(BinaryData::folder_open24px_svg, BinaryData::folder_open24px_svgSize, juce::Colours::black);
+        iconsLoaded = true;
+    }
 
     moreOptions.setToggleState (isSelected, juce::dontSendNotification);
     const auto isCurrent = presetsView->state.presetHash == data.uuid;
@@ -619,14 +677,13 @@ void PresetsView::PresetView::paint (juce::Graphics& g)
     if (isSelected)
         g.fillAll (isCurrent ? TickLookAndFeel::Colours::mint : juce::Colours::white);
 
-    const auto textColor = isSelected ? juce::Colours::black : isCurrent ? TickLookAndFeel::Colours::mint : juce::Colours::white;
-    image->replaceColour (juce::Colours::black, textColor);
-    image->drawWithin (g, getLocalBounds().removeFromLeft (getHeight()).reduced (12).toFloat(), juce::RectanglePlacement(), 1.0f);
-    auto& nameLabel = name;
-    MessageManager::callAsync ([&nameLabel, textColor]
-                               {
-        nameLabel.setColour (juce::Label::textColourId, textColor);
-        nameLabel.setColour (juce::Label::textWhenEditingColourId, textColor); });
+    const int cState = isSelected ? Selected : (isCurrent ? Current : Normal);
+    auto* image = icons[data.isFolder ? 1 : 0][cState].get();
+
+    if (image != nullptr)
+    {
+        image->drawWithin (g, getLocalBounds().removeFromLeft (getHeight()).reduced (12).toFloat(), juce::RectanglePlacement(), 1.0f);
+    }
 }
 
 void PresetsView::PresetView::resized()

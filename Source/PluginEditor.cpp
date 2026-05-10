@@ -86,6 +86,14 @@ TickAudioProcessorEditor::TickAudioProcessorEditor (TickAudioProcessor& p)
 
     settingsButton.onClick = [this]
     {
+        // GUI-Optimering: Om panelen redan är öppen, stäng den bara direkt! 
+        // Detta undviker att datorn allokerar och bygger hela menyn i onödan.
+        if (sidePanel.isPanelShowing())
+        {
+            sidePanel.showOrHide (false);
+            return;
+        }
+
         auto slider = std::make_unique<TickUtils::ParameterSliderItem> (tickProcessor.getAPVTS(), IDs::filterCutoff.toString());
         slider->slider.setScrollWheelEnabled (false);
         PopupMenu settings;
@@ -174,6 +182,7 @@ TickAudioProcessorEditor::TickAudioProcessorEditor (TickAudioProcessor& p)
         sideBarContent->setShouldCloseOnItemClick (true, [this]
                                                    { sidePanel.showOrHide (false); });
         sidePanel.setContent (sideBarContent.release());
+        sidePanel.toFront (true);
         sidePanel.showOrHide (! sidePanel.isPanelShowing());
     };
 
@@ -210,6 +219,8 @@ TickAudioProcessorEditor::TickAudioProcessorEditor (TickAudioProcessor& p)
 
     presetsView.reset (new PresetsView (tickProcessor.getState(), tickProcessor.getTicks()));
     addAndMakeVisible (*presetsView);
+
+    addAndMakeVisible (sidePanel);
 
     sidePanelArea.setAlwaysOnTop (false);
 
@@ -330,16 +341,17 @@ void TickAudioProcessorEditor::resized()
     background.separatorLineY = headerArea.getBottom() + 1;
 
     sidePanelArea.setBounds (availableArea);
+    sidePanel.setBounds (getLocalBounds());
 
     if (! transportOnTopBar)
     {
         addAndMakeVisible (bottomBar);
         bottomBar.setBounds (topArea.removeFromBottom (TickLookAndFeel::toolbarHeight));
     }
-    editModeButton.setBounds (headerArea.getBounds().removeFromRight (60));
-    samplesButton.setBounds (headerArea.getBounds().removeFromLeft (headerArea.getHeight()).reduced (TickLookAndFeel::reducePixels));
-
-    settingsButton.setBounds (samplesButton.getBounds().reduced (TickLookAndFeel::reducePixels));
+    auto headerRect = headerArea.getBounds();
+    settingsButton.setBounds (headerRect.removeFromRight (headerArea.getHeight()).reduced (TickLookAndFeel::reducePixels));
+    editModeButton.setBounds (headerRect.removeFromRight (60));
+    samplesButton.setBounds (headerArea.getLocalBounds().removeFromLeft (headerArea.getHeight()).reduced (TickLookAndFeel::reducePixels));
     mainArea.setBounds (topArea);
 
     background.setBounds (getLocalBounds());
@@ -439,9 +451,20 @@ void TickAudioProcessorEditor::timerCallback()
     const bool useHostTransport = tickProcessor.getState().useHostTransport.get();
     const int preCount = tickProcessor.getState().transport.preCount.get();
     performView->update (tickProcessor.getCurrentBeatPos());
-    bottomBar.transportButton.setVisible (! useHostTransport);
-    bottomBar.preCountIndicator.setVisible (! useHostTransport && preCount > 0);
-    bottomBar.preCountIndicator.setButtonText (String (preCount) + "BAR");
+    if (bottomBar.transportButton.isVisible() == useHostTransport)
+        bottomBar.transportButton.setVisible (! useHostTransport);
+        
+    const bool showPreCount = ! useHostTransport && preCount > 0;
+    if (bottomBar.preCountIndicator.isVisible() != showPreCount)
+        bottomBar.preCountIndicator.setVisible (showPreCount);
+        
+    if (showPreCount)
+    {
+        const char* preStrs[] = { "0BAR", "1BAR", "2BAR", "3BAR", "4BAR" };
+        const juce::String preStr = (preCount <= 4) ? juce::String(preStrs[preCount]) : (juce::String (preCount) + "BAR");
+        if (bottomBar.preCountIndicator.getButtonText() != preStr)
+            bottomBar.preCountIndicator.setButtonText (preStr);
+    }
 #if JUCE_IOS
     const auto link = tickProcessor.m_link.isLinkConnected();
     bottomBar.transportButton.setColour (juce::DrawableButton::backgroundColourId, link ? TickLookAndFeel::Colours::mint : Colours::transparentBlack);
@@ -452,11 +475,6 @@ void TickAudioProcessorEditor::timerCallback()
     if (useHostTransport)
     {
         bottomBar.transportPosition.setText (TickUtils::generateTimecodeDisplay (tickProcessor.playheadPosition_), dontSendNotification);
-    }
-    else if (isVisible() && isShowing())
-    {
-        // When plug-in is self controlled, we want spacebar to work
-        grabKeyboardFocus();
     }
 }
 

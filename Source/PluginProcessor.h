@@ -145,4 +145,11 @@ private:
     // Trådsäker UI-variabel för visuell metronom-ritning utan Data Race
     std::atomic<double> uiCurrentBeatPos { 0.0 };
     std::atomic<int> uiCurrentBeat { 1 };
+
+    // Trådsäker överföring från Ljudtråd -> ValueTree (GUI) för att förhindra krascher
+    std::atomic<float> uiBpm { -1.0f };
+    std::atomic<int> uiNumerator { -1 };
+    std::atomic<int> uiDenominator { -1 };
+    std::atomic<int> uiIsPlaying { -1 };
+    std::atomic<int> uiUseHost { -1 };
 }; // end class TickAudioProcessor
