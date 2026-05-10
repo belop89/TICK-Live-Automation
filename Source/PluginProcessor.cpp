@@ -289,18 +289,25 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
             const int status = data[0] & 0xF0;
             const int channel = (data[0] & 0x0F) + 1;
             
-            // --- NY FUNKTION: Program Change till BPM (Kanal 12, 13 & 14) ---
-            if (status == 0xC0) // 0xC0 = Program Change
+            // --- NY FUNKTION: Universell BPM-mottagning (Kanal 10, 11 & 12) ---
+            // Accepterar Program Change, Note On, och Control Change för att kringgå Cubase-filtrering!
+            if (status == 0xC0 || status == 0x90 || status == 0xB0)
             {
-                const int pcValue = data[1]; // MIDI PC är alltid 0-127
-                double newBpm = 0.0;
-                
-                if (channel == 10 && pcValue > 0) newBpm = pcValue;
-                else if (channel == 11 && pcValue > 0) newBpm = pcValue + 100.0;
-                else if (channel == 12 && pcValue > 0) newBpm = pcValue + 200.0;
+                int val = -1;
+                if (status == 0xC0) val = data[1]; // Program Change
+                else if (status == 0x90 && data[2] > 0) val = data[1]; // Note On (velocity > 0)
+                // Säkerhet: Vid CC, lyssna ENDAST på CC-nummer 119 för att förhindra att Mod-wheel/Volym/Sustain ändrar tempot!
+                else if (status == 0xB0 && data[1] == 119) val = data[2]; // Control Change (CC)
 
-                if (newBpm > 0.0)
+                if (val > 0)
                 {
+                    double newBpm = 0.0;
+                    if (channel == 10) newBpm = val;
+                    else if (channel == 11) newBpm = val + 100.0;
+                    else if (channel == 12) newBpm = val + 200.0;
+
+                    if (newBpm > 0.0)
+                    {
                     uiUseHost.store(0, std::memory_order_relaxed);
                     uiBpm.store((float)newBpm, std::memory_order_relaxed);
                     uiIsPlaying.store(1, std::memory_order_relaxed);

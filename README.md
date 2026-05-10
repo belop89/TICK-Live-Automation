@@ -6,11 +6,11 @@ While the original TICK is a fantastic, cross-platform, sample-accurate metronom
 
 ## 🚀 Key Features in this Fork
 
-### 1. SongBook / Setlist App Integration (No-Math BPM routing)
-To bypass the strict 127 maximum value limit of the MIDI protocol without requiring the user to do complex math in their setlist app, this version uses a smart multi-channel Program Change (PC) system to set the BPM directly:
-* **MIDI Channel 10:** PC values 1-99 set the BPM directly to 1-99.
-* **MIDI Channel 11:** Adds 100 to the PC value (e.g., PC 70 = 170 BPM).
-* **MIDI Channel 12:** Adds 200 to the PC value (e.g., PC 70 = 270 BPM).
+### 1. SongBook / Setlist App Integration (Universal BPM routing)
+To bypass the strict 127 maximum value limit of the MIDI protocol, this version uses a smart multi-channel system. It accepts **Program Change (PC)**, **Note On**, or **Control Change (CC)** to set the BPM directly, bypassing any DAW VST3 filtering:
+* **MIDI Channel 10:** Value 1-99 sets the BPM directly to 1-99.
+* **MIDI Channel 11:** Adds 100 to the value (e.g., Note 70 = 170 BPM).
+* **MIDI Channel 12:** Adds 200 to the value (e.g., Note 70 = 270 BPM).
 *(Channel 16 is completely ignored by the metronome, allowing it to be used exclusively for lighting/video cues).*
 
 ### 2. Jitter-Free MIDI Beat Clock Generator
