@@ -268,6 +268,10 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     const float currentMasterGain = masterGain->load(std::memory_order_relaxed);
     const float currentTickMultiplier = tickMultiplier.load(std::memory_order_relaxed);
 
+    // DSP-Optimering: Läs in MIDI-parametrar EN gång per block istället för varje tick
+    const int currentNote1 = midiNoteBeat1Param ? juce::roundToInt(midiNoteBeat1Param->load(std::memory_order_relaxed)) : 34;
+    const int currentNoteOther = midiNoteOtherParam ? juce::roundToInt(midiNoteOtherParam->load(std::memory_order_relaxed)) : 33;
+
     bool forceSongRestart = false;
     bool tapTriggered = false;
 
@@ -510,8 +514,9 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         {
         const auto ppqPosition = playheadPosition_.getPpqPosition().orFallback(0);
         const auto lastBarStart = playheadPosition_.getPpqPositionOfLastBarStart().orFallback(0);
-        // Säkerhet: Förhindra Infinity-krasch (Division by Zero) om DAW-automationen slår ner i 0 BPM!
-        const auto bpm = juce::jmax(0.001f, (float)playheadPosition_.getBpm().orFallback(120.0f));
+        // Säkerhet: Förhindra Integer Overflow-krasch! Om DAW-automationen går nära 0 BPM, 
+        // blir antalet samples per slag > 2.14 miljarder vilket kraschar 32-bitars integers.
+        const auto bpm = juce::jmax(1.0f, (float)playheadPosition_.getBpm().orFallback(120.0f));
         const auto ts = playheadPosition_.getTimeSignature().orFallback(AudioPlayHead::TimeSignature ({1, 4}));
         
         // calculate where tick starts in samples...
@@ -601,13 +606,12 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
 
                     // --- NY FUNKTION: Skicka MIDI-not ut för varje metronom-klick! ---
                     // Användarspecifika noter via inställningarna (Kanal 10 - Trummor)
-                    const int note1 = midiNoteBeat1Param ? juce::roundToInt(midiNoteBeat1Param->load(std::memory_order_relaxed)) : 34;
-                    const int noteOther = midiNoteOtherParam ? juce::roundToInt(midiNoteOtherParam->load(std::memory_order_relaxed)) : 33;
-                    const int midiNote = (tickState.beat == 1) ? note1 : noteOther;
+                    const int midiNote = (tickState.beat == 1) ? currentNote1 : currentNoteOther;
                     const juce::uint8 velocity = (juce::uint8)juce::jlimit(1, 127, (int)(tickState.beatGain * 127.0f));
                     midiMessages.addEvent(juce::MidiMessage::noteOn(10, midiNote, velocity), currentSampleToTick);
                     
-                    const int noteOffSample = juce::jmin(currentSampleToTick + 500, (int)buffer.getNumSamples() - 1);
+                    // FIX: Förhindra krasch (KERNELBASE.dll) om Cubase skickar "Flush"-buffertar med 0 samples (då blir index -1!)
+                    const int noteOffSample = juce::jlimit(0, juce::jmax(0, buffer.getNumSamples() - 1), currentSampleToTick + 500);
                     midiMessages.addEvent(juce::MidiMessage::noteOff(10, midiNote, (juce::uint8)0), noteOffSample);
                 }
             }
@@ -622,9 +626,14 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     // Säkerhet: Förhindra krasch vid flush-block (0 samples eller 0 kanaler)
     size_t safeChannels = (size_t) juce::jmax(0, numChannels);
     size_t safeSamples = (size_t) juce::jmax(0, buffer.getNumSamples());
-    juce::dsp::AudioBlock<float> block (buffer.getArrayOfWritePointers(), safeChannels, safeSamples);
-    juce::dsp::ProcessContextReplacing<float> context (block);
-    lpfFilter.process (context);
+    
+    // FIX: Processa endast filtret om det faktiskt finns ljud att processa! Förhindrar Memory Access Violation.
+    if (safeChannels > 0 && safeSamples > 0)
+    {
+        juce::dsp::AudioBlock<float> block (buffer.getArrayOfWritePointers(), safeChannels, safeSamples);
+        juce::dsp::ProcessContextReplacing<float> context (block);
+        lpfFilter.process (context);
+    }
 
     // DSP-Optimering: Anropa inte 'std::pow' (decibelsToGain) för varje ljudblock!
     // Cacha multiplikatorn och uppdatera bara när volymen faktiskt ändras av användaren.

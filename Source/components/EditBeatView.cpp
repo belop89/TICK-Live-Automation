@@ -14,15 +14,26 @@
 #include "JUX/components/ListBoxMenu.h"
 #include "utils/UtilityFunctions.h"
 
-struct SharedEditIcons
+struct SharedEditIcons : public juce::DeletedAtShutdown
 {
     std::unique_ptr<juce::Drawable> moreIcon;
+
     SharedEditIcons()
     {
         moreIcon = juce::Drawable::createFromImageData (BinaryData::more_vert24px_svg, BinaryData::more_vert24px_svgSize);
         if (moreIcon != nullptr) moreIcon->replaceColour (juce::Colours::black, juce::Colours::white);
     }
+    ~SharedEditIcons() override { instance = nullptr; }
+
+    static SharedEditIcons& getInstance()
+    {
+        if (instance == nullptr)
+            instance = new SharedEditIcons();
+        return *instance;
+    }
+    static SharedEditIcons* instance;
 };
+SharedEditIcons* SharedEditIcons::instance = nullptr;
 
 EditBeatView::EditBeatView (TickSettings& stateRef, TicksHolder& ticksRef)
     : model (*this), fileChooser ("Import Audio", juce::File::getSpecialLocation (juce::File::userDocumentsDirectory), "*.wav;*.wave;*.aif;*.aiff;*.mp3;*.flac", TickUtils::usePlatformDialog()
@@ -151,6 +162,8 @@ void EditBeatView::updateSelection (const std::vector<int>& newSelection)
     {
         beatLabel.setVisible (false);
         beatVolume.setVisible (false);
+        beatScrollBack.setVisible (false);     // FIX: Göm "spök-knappar" vid tom markering för att förhindra krasch!
+        beatScrollForward.setVisible (false);
         hintText.setVisible (true);
         samplesList.setVisible (false);
         return;
@@ -246,10 +259,10 @@ void EditBeatView::SamplesModel::SampleOption::paint (juce::Graphics& g)
         return;
 
     {
-        // GUI-Optimering: Använd SharedResourcePointer för att undvika "Leaked Objects" krasch vid nedstängning
-        juce::SharedResourcePointer<SharedEditIcons> sharedIcons;
-        if (sharedIcons->moreIcon != nullptr)
-            sharedIcons->moreIcon->drawWithin (g, getLocalBounds().removeFromRight (getHeight()).reduced (10).toFloat(), juce::RectanglePlacement::centred, 1.0f);
+        // GUI-Optimering: Använd DeletedAtShutdown för att slippa trådlås i paint() och undvika minnesläckor
+        auto& sharedIcons = SharedEditIcons::getInstance();
+        if (sharedIcons.moreIcon != nullptr)
+            sharedIcons.moreIcon->drawWithin (g, getLocalBounds().removeFromRight (getHeight()).reduced (10).toFloat(), juce::RectanglePlacement::centred, 1.0f);
     }
 }
 
@@ -305,9 +318,13 @@ void EditBeatView::SamplesModel::SampleOption::mouseDown (const juce::MouseEvent
                 }
                 case 4:
                 {
-                    const auto currentSelection = safeThis->owner.selection[0];
-                    for (auto i = currentSelection; i < TickSettings::kMaxBeatAssignments; ++i)
-                        safeThis->owner.state.beatAssignments[i].tickIdx = safeThis->row;
+                    // Säkerhet: Förhindra array "Out of Bounds"-krasch om listan mot förmodan är tom
+                    if (! safeThis->owner.selection.empty())
+                    {
+                        const auto currentSelection = safeThis->owner.selection.front();
+                        for (auto i = currentSelection; i < TickSettings::kMaxBeatAssignments; ++i)
+                            safeThis->owner.state.beatAssignments[i].tickIdx = safeThis->row;
+                    }
                     break;
                 }
                 default:
@@ -371,8 +388,12 @@ void EditBeatView::setNewImportedSample (const int replaceIndex, std::unique_ptr
     if (replaceIndex == -1)
     {
         ticks.addTick (std::move (newTick));
-        state.beatAssignments[selection.front()].tickIdx = { static_cast<int> (ticks.getNumOfTicks() - 1) };
-        updateSelection (selection);
+        // Säkerhet: Förhindra krasch om användaren importerar ljud utan att ha markerat ett slag!
+        if (! selection.empty())
+        {
+            state.beatAssignments[selection.front()].tickIdx = { static_cast<int> (ticks.getNumOfTicks() - 1) };
+            updateSelection (selection);
+        }
     }
     else
         ticks.replaceTick (replaceIndex, std::move (newTick));

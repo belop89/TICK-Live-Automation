@@ -188,10 +188,10 @@ TickAudioProcessorEditor::TickAudioProcessorEditor (TickAudioProcessor& p)
 
         auto sideBarContent = std::make_unique<jux::ListBoxMenu>();
         sideBarContent->setMenuFromPopup (std::move (settings));
-        sideBarContent->setOnRootBackToParent ([this]
-                                               { sidePanel.showOrHide (false); });
-        sideBarContent->setShouldCloseOnItemClick (true, [this]
-                                                   { sidePanel.showOrHide (false); });
+        sideBarContent->setOnRootBackToParent ([safeThis = juce::Component::SafePointer<TickAudioProcessorEditor>(this)]
+                                               { if (safeThis != nullptr) safeThis->sidePanel.showOrHide (false); });
+        sideBarContent->setShouldCloseOnItemClick (true, [safeThis = juce::Component::SafePointer<TickAudioProcessorEditor>(this)]
+                                                   { if (safeThis != nullptr) safeThis->sidePanel.showOrHide (false); });
         sidePanel.setContent (sideBarContent.release());
         sidePanel.toFront (true);
         sidePanel.showOrHide (! sidePanel.isPanelShowing());
@@ -472,7 +472,8 @@ void TickAudioProcessorEditor::timerCallback()
     if (showPreCount)
     {
         const char* preStrs[] = { "0BAR", "1BAR", "2BAR", "3BAR", "4BAR" };
-        const juce::String preStr = (preCount <= 4) ? juce::String(preStrs[preCount]) : (juce::String (preCount) + "BAR");
+        // Säkerhet: Förhindra krasch genom att hämta negativa index om DAW:en tvingar preCount till < 0
+        const juce::String preStr = (preCount >= 0 && preCount <= 4) ? juce::String(preStrs[preCount]) : (juce::String (preCount) + "BAR");
         if (bottomBar.preCountIndicator.getButtonText() != preStr)
             bottomBar.preCountIndicator.setButtonText (preStr);
     }

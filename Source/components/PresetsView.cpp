@@ -5,7 +5,7 @@
 #include "TopBar.h"
 #include "utils/UtilityFunctions.h"
 
-struct SharedPresetIcons
+struct SharedPresetIcons : public juce::DeletedAtShutdown
 {
     std::unique_ptr<juce::Drawable> more, moreInverted;
     std::unique_ptr<juce::Drawable> editIcon, deleteIcon, shareIcon;
@@ -31,7 +31,17 @@ struct SharedPresetIcons
         listIcons[1][1] = loadIcon(BinaryData::folder_open24px_svg, BinaryData::folder_open24px_svgSize, TickLookAndFeel::Colours::mint);
         listIcons[1][2] = loadIcon(BinaryData::folder_open24px_svg, BinaryData::folder_open24px_svgSize, juce::Colours::black);
     }
+    ~SharedPresetIcons() override { instance = nullptr; }
+
+    static SharedPresetIcons& getInstance()
+    {
+        if (instance == nullptr)
+            instance = new SharedPresetIcons();
+        return *instance;
+    }
+    static SharedPresetIcons* instance;
 };
+SharedPresetIcons* SharedPresetIcons::instance = nullptr;
 
 static void createFolderCallback (int modalResult, PresetsView* view, juce::Component::SafePointer<DialogComponent> alert)
 {
@@ -475,6 +485,7 @@ void PresetsView::transitionList()
     //    getToolbar()->backButton.setVisible (false);
     auto& animator = juce::Desktop::getInstance().getAnimator();
     animator.addChangeListener (this);
+    list.toFront (true); // FIX: Tvinga den nya listan att ritas OVANPÅ vår transition-snapshot!
     auto finalBounds = list.getBounds();
     list.setBounds (finalBounds.translated (getWidth(), 0));
     animator.animateComponent (&list, finalBounds, 1.0, 300, false, 0.3, 0.0);
@@ -552,10 +563,12 @@ juce::Component* PresetsView::PresetModel::refreshComponentForRow (int rowNumber
 PresetsView::PresetView::PresetView()
     : moreOptions ("More Options...", juce::DrawableButton::ImageFitted)
 {
-    juce::SharedResourcePointer<SharedPresetIcons> icons;
+    // FIX: Hämta säkert från DeletedAtShutdown singleton istället för lokal SharedResourcePointer.
+    // Detta förhindrar dangling pointers (krasch!) när knappen försöker rita ikonerna!
+    auto& icons = SharedPresetIcons::getInstance();
 
     moreOptions.setColour (juce::DrawableButton::backgroundOnColourId, juce::Colours::transparentBlack);
-    moreOptions.setImages (icons->more.get(), nullptr, nullptr, nullptr, icons->moreInverted.get());
+    moreOptions.setImages (icons.more.get(), nullptr, nullptr, nullptr, icons.moreInverted.get());
     addAndMakeVisible (moreOptions);
     name.setInterceptsMouseClicks (false, true);
     name.setFont (16.0f);
@@ -564,12 +577,12 @@ PresetsView::PresetView::PresetView()
 
     moreOptions.onClick = [this] {
         juce::PopupMenu p;
-        juce::SharedResourcePointer<SharedPresetIcons> icons;
-        p.addItem (1, "Rename..", true, false, icons->editIcon ? icons->editIcon->createCopy() : nullptr);
-        p.addItem (2, "Delete", true, false, icons->deleteIcon ? icons->deleteIcon->createCopy() : nullptr);
+        auto& icons = SharedPresetIcons::getInstance();
+        p.addItem (1, "Rename..", true, false, icons.editIcon ? icons.editIcon->createCopy() : nullptr);
+        p.addItem (2, "Delete", true, false, icons.deleteIcon ? icons.deleteIcon->createCopy() : nullptr);
         p.addSeparator();
 #if JUCE_IOS || JUCE_ANDROID
-        p.addItem (3, "Share", true, false, icons->shareIcon ? icons->shareIcon->createCopy() : nullptr);
+        p.addItem (3, "Share", true, false, icons.shareIcon ? icons.shareIcon->createCopy() : nullptr);
 #endif
         auto options = juce::PopupMenu::Options().withParentComponent (presetsView).withTargetComponent (moreOptions);
         p.showMenuAsync (options, [safeThis = juce::Component::SafePointer<PresetView>(this)] (int value) {
@@ -636,16 +649,20 @@ void PresetsView::queryPreset (juce::File fileToQuery, PresetData& dataToFill)
         else
         {
             auto data = std::unique_ptr<InputStream> (archive.createStreamForEntry (idx));
-            const auto stateDataToLoad = ValueTree::fromXml (data->readString());
-            dataToFill.name = stateDataToLoad.getProperty (IDs::presetName);
-            auto transport = stateDataToLoad.getChildWithName (IDs::TRANSPORT);
-            dataToFill.uuid = stateDataToLoad.getProperty (IDs::uuid);
-            if (transport.isValid())
+            // Säkerhet: Förhindra "Null Pointer Dereference" om preset-filen är skadad eller inte kunde läsas
+            if (data != nullptr)
             {
-                dataToFill.containsTime = true;
-                dataToFill.bpm = transport.getProperty (IDs::bpm, -1);
-                dataToFill.numerator = transport.getProperty (IDs::numerator, -1);
-                dataToFill.denumerator = transport.getProperty (IDs::denumerator, -1);
+                const auto stateDataToLoad = ValueTree::fromXml (data->readString());
+                dataToFill.name = stateDataToLoad.getProperty (IDs::presetName);
+                auto transport = stateDataToLoad.getChildWithName (IDs::TRANSPORT);
+                dataToFill.uuid = stateDataToLoad.getProperty (IDs::uuid);
+                if (transport.isValid())
+                {
+                    dataToFill.containsTime = true;
+                    dataToFill.bpm = transport.getProperty (IDs::bpm, -1);
+                    dataToFill.numerator = transport.getProperty (IDs::numerator, -1);
+                    dataToFill.denumerator = transport.getProperty (IDs::denumerator, -1);
+                }
             }
         }
     }
@@ -656,27 +673,8 @@ void PresetsView::PresetView::paint (juce::Graphics& g)
     if (! isReady)
         return;
 
-    // SUPER-OPTIMERING: Skapa färg-kopiorna av ikonerna EN enda gång i minnet.
-    // Tar bort onödiga 'createCopy'-allokeringar (undviker minnesallokering per frame för varje rad!)
     enum ColorState { Normal = 0, Current = 1, Selected = 2 };
-    static std::unique_ptr<juce::Drawable> icons[2][3];
-    static bool iconsLoaded = false;
-    if (!iconsLoaded)
-    {
-        auto loadIcon = [](const char* svgData, int size, juce::Colour color) {
-            auto d = juce::Drawable::createFromImageData(svgData, size);
-            if (d != nullptr) d->replaceColour(juce::Colours::black, color);
-            return d;
-        };
-        icons[0][Normal] = loadIcon(BinaryData::metro_tick_icon_svg, BinaryData::metro_tick_icon_svgSize, juce::Colours::white);
-        icons[0][Current] = loadIcon(BinaryData::metro_tick_icon_svg, BinaryData::metro_tick_icon_svgSize, TickLookAndFeel::Colours::mint);
-        icons[0][Selected] = loadIcon(BinaryData::metro_tick_icon_svg, BinaryData::metro_tick_icon_svgSize, juce::Colours::black);
-        
-        icons[1][Normal] = loadIcon(BinaryData::folder_open24px_svg, BinaryData::folder_open24px_svgSize, juce::Colours::white);
-        icons[1][Current] = loadIcon(BinaryData::folder_open24px_svg, BinaryData::folder_open24px_svgSize, TickLookAndFeel::Colours::mint);
-        icons[1][Selected] = loadIcon(BinaryData::folder_open24px_svg, BinaryData::folder_open24px_svgSize, juce::Colours::black);
-        iconsLoaded = true;
-    }
+    auto& icons = SharedPresetIcons::getInstance();
 
     moreOptions.setToggleState (isSelected, juce::dontSendNotification);
     const auto isCurrent = presetsView->state.presetHash == data.uuid;
@@ -685,7 +683,7 @@ void PresetsView::PresetView::paint (juce::Graphics& g)
         g.fillAll (isCurrent ? TickLookAndFeel::Colours::mint : juce::Colours::white);
 
     const int cState = isSelected ? Selected : (isCurrent ? Current : Normal);
-    auto* image = icons[data.isFolder ? 1 : 0][cState].get();
+    auto* image = icons.listIcons[data.isFolder ? 1 : 0][cState].get();
 
     if (image != nullptr)
     {
