@@ -14,6 +14,16 @@
 #include "JUX/components/ListBoxMenu.h"
 #include "utils/UtilityFunctions.h"
 
+struct SharedEditIcons
+{
+    std::unique_ptr<juce::Drawable> moreIcon;
+    SharedEditIcons()
+    {
+        moreIcon = juce::Drawable::createFromImageData (BinaryData::more_vert24px_svg, BinaryData::more_vert24px_svgSize);
+        if (moreIcon != nullptr) moreIcon->replaceColour (juce::Colours::black, juce::Colours::white);
+    }
+};
+
 EditBeatView::EditBeatView (TickSettings& stateRef, TicksHolder& ticksRef)
     : model (*this), fileChooser ("Import Audio", juce::File::getSpecialLocation (juce::File::userDocumentsDirectory), "*.wav;*.wave;*.aif;*.aiff;*.mp3;*.flac", TickUtils::usePlatformDialog()
 #if JUCE_IOS
@@ -236,14 +246,10 @@ void EditBeatView::SamplesModel::SampleOption::paint (juce::Graphics& g)
         return;
 
     {
-        // GUI-Optimering: Ladda SVG-ikonen en enda gång i minnet istället för varje bildruta!
-        static std::unique_ptr<juce::Drawable> img = [] {
-            auto d = juce::Drawable::createFromImageData (BinaryData::more_vert24px_svg, BinaryData::more_vert24px_svgSize);
-            d->replaceColour (juce::Colours::black, juce::Colours::white);
-            return d;
-        }();
-        if (img != nullptr)
-            img->drawWithin (g, getLocalBounds().removeFromRight (getHeight()).reduced (10).toFloat(), RectanglePlacement::centred, 1.0f);
+        // GUI-Optimering: Använd SharedResourcePointer för att undvika "Leaked Objects" krasch vid nedstängning
+        juce::SharedResourcePointer<SharedEditIcons> sharedIcons;
+        if (sharedIcons->moreIcon != nullptr)
+            sharedIcons->moreIcon->drawWithin (g, getLocalBounds().removeFromRight (getHeight()).reduced (10).toFloat(), juce::RectanglePlacement::centred, 1.0f);
     }
 }
 
@@ -272,11 +278,18 @@ void EditBeatView::SamplesModel::SampleOption::mouseDown (const juce::MouseEvent
                     safeThis->owner.listboxMenu->setRowHeight (50);
                     safeThis->owner.listboxMenu->setMenuFromPopup (std::move (addSamplesMenu));
                     safeThis->owner.listboxMenu->setShouldCloseOnItemClick (true);
-                    safeThis->owner.getParentComponent()->addAndMakeVisible (safeThis->owner.listboxMenu.get());
-                    safeThis->owner.listboxMenu->setBounds (safeThis->owner.getParentComponent()->getLocalBounds());
-                    safeThis->owner.listboxMenu->toFront (true);
+                    
+                    // Säkerhet: Kolla att komponenten fortfarande är fäst i gränssnittet innan ritning!
+                    if (auto* parent = safeThis->owner.getParentComponent())
+                    {
+                        parent->addAndMakeVisible (safeThis->owner.listboxMenu.get());
+                        safeThis->owner.listboxMenu->setBounds (parent->getLocalBounds());
+                        safeThis->owner.listboxMenu->toFront (true);
+                    }
                     safeThis->owner.listboxMenu->setOnRootBackToParent ([safeThis]() {
-                        if (safeThis != nullptr) safeThis->owner.getParentComponent()->removeChildComponent (safeThis->owner.listboxMenu.get());
+                        if (safeThis != nullptr && safeThis->owner.listboxMenu != nullptr) 
+                            if (auto* parent = safeThis->owner.getParentComponent())
+                                parent->removeChildComponent (safeThis->owner.listboxMenu.get());
                     });
                 }
                 break;
@@ -396,10 +409,15 @@ void EditBeatView::SamplesModel::listBoxItemClicked (int row, const juce::MouseE
         owner.listboxMenu->setRowHeight (50);
         owner.listboxMenu->setMenuFromPopup (std::move (menu));
         owner.listboxMenu->setOnRootBackToParent ([safeOwner = juce::Component::SafePointer<EditBeatView>(&owner)]() {
-            if (safeOwner != nullptr) safeOwner->getParentComponent()->removeChildComponent (safeOwner->listboxMenu.get());
+            if (safeOwner != nullptr && safeOwner->listboxMenu != nullptr) 
+                if (auto* parent = safeOwner->getParentComponent())
+                    parent->removeChildComponent (safeOwner->listboxMenu.get());
         });
-        owner.getParentComponent()->addAndMakeVisible (owner.listboxMenu.get());
-        owner.listboxMenu->setBounds (owner.getParentComponent()->getLocalBounds());
-        owner.listboxMenu->toFront (true);
+        if (auto* parent = owner.getParentComponent())
+        {
+            parent->addAndMakeVisible (owner.listboxMenu.get());
+            owner.listboxMenu->setBounds (parent->getLocalBounds());
+            owner.listboxMenu->toFront (true);
+        }
     }
 }

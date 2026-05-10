@@ -5,6 +5,34 @@
 #include "TopBar.h"
 #include "utils/UtilityFunctions.h"
 
+struct SharedPresetIcons
+{
+    std::unique_ptr<juce::Drawable> more, moreInverted;
+    std::unique_ptr<juce::Drawable> editIcon, deleteIcon, shareIcon;
+    std::unique_ptr<juce::Drawable> listIcons[2][3];
+
+    SharedPresetIcons()
+    {
+        auto loadIcon = [](const char* svgData, int size, juce::Colour color) {
+            auto d = juce::Drawable::createFromImageData(svgData, size);
+            if (d != nullptr) d->replaceColour(juce::Colours::black, color);
+            return d;
+        };
+        more = loadIcon(BinaryData::more_vert24px_svg, BinaryData::more_vert24px_svgSize, juce::Colours::white);
+        moreInverted = loadIcon(BinaryData::more_vert24px_svg, BinaryData::more_vert24px_svgSize, juce::Colours::white);
+        editIcon = loadIcon(BinaryData::edit24px_svg, BinaryData::edit24px_svgSize, juce::Colours::white);
+        deleteIcon = loadIcon(BinaryData::delete24px_svg, BinaryData::delete24px_svgSize, juce::Colours::white);
+        shareIcon = loadIcon(BinaryData::ios_share_black_24dp_svg, BinaryData::ios_share_black_24dp_svgSize, juce::Colours::white);
+
+        listIcons[0][0] = loadIcon(BinaryData::metro_tick_icon_svg, BinaryData::metro_tick_icon_svgSize, juce::Colours::white);
+        listIcons[0][1] = loadIcon(BinaryData::metro_tick_icon_svg, BinaryData::metro_tick_icon_svgSize, TickLookAndFeel::Colours::mint);
+        listIcons[0][2] = loadIcon(BinaryData::metro_tick_icon_svg, BinaryData::metro_tick_icon_svgSize, juce::Colours::black);
+        listIcons[1][0] = loadIcon(BinaryData::folder_open24px_svg, BinaryData::folder_open24px_svgSize, juce::Colours::white);
+        listIcons[1][1] = loadIcon(BinaryData::folder_open24px_svg, BinaryData::folder_open24px_svgSize, TickLookAndFeel::Colours::mint);
+        listIcons[1][2] = loadIcon(BinaryData::folder_open24px_svg, BinaryData::folder_open24px_svgSize, juce::Colours::black);
+    }
+};
+
 static void createFolderCallback (int modalResult, PresetsView* view, juce::Component::SafePointer<DialogComponent> alert)
 {
     if (modalResult == 1 && view != nullptr)
@@ -524,16 +552,10 @@ juce::Component* PresetsView::PresetModel::refreshComponentForRow (int rowNumber
 PresetsView::PresetView::PresetView()
     : moreOptions ("More Options...", juce::DrawableButton::ImageFitted)
 {
-    // GUI-Optimering: Parse:a menyns ikoner statiskt en gång istället för varje gång en rad ritas
-    static std::unique_ptr<juce::Drawable> more = [] {
-        auto d = juce::Drawable::createFromImageData (BinaryData::more_vert24px_svg, BinaryData::more_vert24px_svgSize);
-        d->replaceColour (juce::Colours::black, juce::Colours::white);
-        return d;
-    }();
-    static std::unique_ptr<juce::Drawable> moreInverted = juce::Drawable::createFromImageData (BinaryData::more_vert24px_svg, BinaryData::more_vert24px_svgSize);
+    juce::SharedResourcePointer<SharedPresetIcons> icons;
 
     moreOptions.setColour (juce::DrawableButton::backgroundOnColourId, juce::Colours::transparentBlack);
-    moreOptions.setImages (more.get(), nullptr, nullptr, nullptr, moreInverted.get());
+    moreOptions.setImages (icons->more.get(), nullptr, nullptr, nullptr, icons->moreInverted.get());
     addAndMakeVisible (moreOptions);
     name.setInterceptsMouseClicks (false, true);
     name.setFont (16.0f);
@@ -542,27 +564,12 @@ PresetsView::PresetView::PresetView()
 
     moreOptions.onClick = [this] {
         juce::PopupMenu p;
-        static std::unique_ptr<juce::Drawable> editIcon = [] {
-            auto d = juce::Drawable::createFromImageData (BinaryData::edit24px_svg, BinaryData::edit24px_svgSize);
-            d->replaceColour (juce::Colours::black, juce::Colours::white);
-            return d;
-        }();
-        static std::unique_ptr<juce::Drawable> deleteIcon = [] {
-            auto d = juce::Drawable::createFromImageData (BinaryData::delete24px_svg, BinaryData::delete24px_svgSize);
-            d->replaceColour (juce::Colours::black, juce::Colours::white);
-            return d;
-        }();
-        static std::unique_ptr<juce::Drawable> shareIcon = [] {
-            auto d = juce::Drawable::createFromImageData (BinaryData::ios_share_black_24dp_svg, BinaryData::ios_share_black_24dp_svgSize);
-            d->replaceColour (juce::Colours::black, juce::Colours::white);
-            return d;
-        }();
-        
-        p.addItem (1, "Rename..", true, false, editIcon->createCopy());
-        p.addItem (2, "Delete", true, false, deleteIcon->createCopy());
+        juce::SharedResourcePointer<SharedPresetIcons> icons;
+        p.addItem (1, "Rename..", true, false, icons->editIcon ? icons->editIcon->createCopy() : nullptr);
+        p.addItem (2, "Delete", true, false, icons->deleteIcon ? icons->deleteIcon->createCopy() : nullptr);
         p.addSeparator();
 #if JUCE_IOS || JUCE_ANDROID
-        p.addItem (3, "Share", true, false, shareIcon->createCopy());
+        p.addItem (3, "Share", true, false, icons->shareIcon ? icons->shareIcon->createCopy() : nullptr);
 #endif
         auto options = juce::PopupMenu::Options().withParentComponent (presetsView).withTargetComponent (moreOptions);
         p.showMenuAsync (options, [safeThis = juce::Component::SafePointer<PresetView>(this)] (int value) {

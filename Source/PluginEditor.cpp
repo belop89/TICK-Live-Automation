@@ -152,6 +152,17 @@ TickAudioProcessorEditor::TickAudioProcessorEditor (TickAudioProcessor& p)
         settings.addSectionHeader ("Master Gain");
         settings.addCustomItem (223, std::move (gainSlider));
         settings.addSeparator();
+
+        auto note1Slider = std::make_unique<TickUtils::ParameterSliderItem> (tickProcessor.getAPVTS(), TickAudioProcessor::kMidiNoteBeat1ID);
+        note1Slider->slider.setScrollWheelEnabled (false);
+        settings.addSectionHeader ("MIDI Note: Beat 1");
+        settings.addCustomItem (224, std::move (note1Slider));
+
+        auto noteOtherSlider = std::make_unique<TickUtils::ParameterSliderItem> (tickProcessor.getAPVTS(), TickAudioProcessor::kMidiNoteOtherID);
+        noteOtherSlider->slider.setScrollWheelEnabled (false);
+        settings.addSectionHeader ("MIDI Note: Other Beats");
+        settings.addCustomItem (225, std::move (noteOtherSlider));
+        settings.addSeparator();
 #if ! JUCE_IOS && ! JUCE_ANDROID
         // for standalone props needs to come from it.
         auto props = standaloneProps != nullptr ? standaloneProps : appProperties.getUserSettings();

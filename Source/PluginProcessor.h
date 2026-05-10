@@ -28,6 +28,8 @@ public:
     //==============================================================================
     // TAP CC ÄNDRING: Deklarera statisk sträng för parameter-ID
     static const juce::String kTapTempoButtonID; 
+    static const juce::String kMidiNoteBeat1ID;
+    static const juce::String kMidiNoteOtherID;
     //==============================================================================
     
     TickAudioProcessor();
@@ -130,6 +132,8 @@ private:
     std::atomic<float> tickMultiplier {1.0f};
     std::atomic<float>* filterCutoff;
     std::atomic<float>* masterGain;
+    std::atomic<float>* midiNoteBeat1Param { nullptr };
+    std::atomic<float>* midiNoteOtherParam { nullptr };
     juce::AudioParameterBool* tapTempoParam { nullptr };
     juce::AudioProcessorValueTreeState parameters;
     //==============================================================================

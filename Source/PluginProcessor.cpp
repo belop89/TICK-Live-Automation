@@ -20,6 +20,8 @@ using namespace juce;
 // NOTE: removed global g_lastTapTimeMs; per-instance lastTapTimeMs används i PluginProcessor.h
 
 const juce::String TickAudioProcessor::kTapTempoButtonID = "tap_tempo";
+const juce::String TickAudioProcessor::kMidiNoteBeat1ID = "midiNoteBeat1";
+const juce::String TickAudioProcessor::kMidiNoteOtherID = "midiNoteOther";
 //==============================================================================
 
 AudioProcessor::BusesProperties TickAudioProcessor::getDefaultLayout()
@@ -66,7 +68,13 @@ TickAudioProcessor::TickAudioProcessor()
           // TAP CC ÄNDRING: Tap-parametern som nytt element
           std::make_unique<juce::AudioParameterBool> (ParameterID (kTapTempoButtonID, 1), 
                                                       "Tap", 
-                                                      false)
+                                                      false),
+          std::make_unique<juce::AudioParameterInt> (ParameterID (kMidiNoteBeat1ID, 1), 
+                                                     "MIDI Note (Beat 1)", 
+                                                     0, 127, 34),
+          std::make_unique<juce::AudioParameterInt> (ParameterID (kMidiNoteOtherID, 1), 
+                                                     "MIDI Note (Other)", 
+                                                     0, 127, 33)
       })
 {
     // init samples reading
@@ -76,6 +84,8 @@ TickAudioProcessor::TickAudioProcessor()
     filterCutoff = parameters.getRawParameterValue (IDs::filterCutoff.toString());
     masterGain = parameters.getRawParameterValue (IDs::masterGain.toString());
     tapTempoParam = dynamic_cast<juce::AudioParameterBool*> (parameters.getParameter (kTapTempoButtonID));
+    midiNoteBeat1Param = parameters.getRawParameterValue (kMidiNoteBeat1ID);
+    midiNoteOtherParam = parameters.getRawParameterValue (kMidiNoteOtherID);
 
     // load default preset
     setStateInformation (BinaryData::factory_default_preset, BinaryData::factory_default_presetSize);
@@ -83,6 +93,10 @@ TickAudioProcessor::TickAudioProcessor()
     settings.useHostTransport.setValue (wrapperType != WrapperType::wrapperType_Standalone, nullptr);
     playheadPosition_ = juce::AudioPlayHead::PositionInfo();
     settings.isDirty = false;
+
+    // Default till Play-läge direkt vid inladdning
+    settings.transport.isPlaying.setValue(true, nullptr);
+    uiIsPlaying.store(1, std::memory_order_relaxed);
 }
 
 TickAudioProcessor::~TickAudioProcessor()
@@ -159,7 +173,7 @@ void TickAudioProcessor::changeProgramName (int /*index*/, const String& /*newNa
 }
 
 //==============================================================================
-void TickAudioProcessor::prepareToPlay (double sampleRate, int /*samplesPerBlock*/)
+void TickAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     // Säkerhetsspärr: Garantera alltid en rimlig minimum sample rate vid allokering för att
     // undvika att minnesbuffertar blir för små vid DAW-quirks eller byten av ljudkort!
@@ -174,7 +188,9 @@ void TickAudioProcessor::prepareToPlay (double sampleRate, int /*samplesPerBlock
     // Förbered det nya juce::dsp-filtret
     juce::dsp::ProcessSpec spec;
     spec.sampleRate = safeSr;
-    spec.maximumBlockSize = (uint32_t)(safeSr * 10.0);
+    // FIX: Allokera filtret efter DAW:ens aktuella buffertstorlek, inte 10 sekunder. 
+    // Det sparar massivt med onödigt RAM-minne (upp till flera megabyte per instans)!
+    spec.maximumBlockSize = (uint32_t)juce::jmax(1, samplesPerBlock);
     // FIX: Sätt kanalantalet till dynamiskt (oftast 2 för Stereo) för att undvika minneskrasch i filtret
     spec.numChannels = (uint32_t)juce::jmax(1, getTotalNumOutputChannels());
     lpfFilter.prepare(spec);
@@ -582,6 +598,17 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                     tickState.beatGain = beatAssign.gain.get() * ticks[tickIdx].getGain();
                     // FIX: Begränsa läsningen till ljudfilens faktiska längd för att undvika spökecho/skräp-ljud!
                     tickState.addTickSample (buffer, currentSampleToTick, playLen);
+
+                    // --- NY FUNKTION: Skicka MIDI-not ut för varje metronom-klick! ---
+                    // Användarspecifika noter via inställningarna (Kanal 10 - Trummor)
+                    const int note1 = midiNoteBeat1Param ? juce::roundToInt(midiNoteBeat1Param->load(std::memory_order_relaxed)) : 34;
+                    const int noteOther = midiNoteOtherParam ? juce::roundToInt(midiNoteOtherParam->load(std::memory_order_relaxed)) : 33;
+                    const int midiNote = (tickState.beat == 1) ? note1 : noteOther;
+                    const juce::uint8 velocity = (juce::uint8)juce::jlimit(1, 127, (int)(tickState.beatGain * 127.0f));
+                    midiMessages.addEvent(juce::MidiMessage::noteOn(10, midiNote, velocity), currentSampleToTick);
+                    
+                    const int noteOffSample = juce::jmin(currentSampleToTick + 500, (int)buffer.getNumSamples() - 1);
+                    midiMessages.addEvent(juce::MidiMessage::noteOff(10, midiNote, (juce::uint8)0), noteOffSample);
                 }
             }
         }
