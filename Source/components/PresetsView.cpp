@@ -47,8 +47,8 @@ static void createFolderCallback (int modalResult, PresetsView* view, juce::Comp
 {
     if (modalResult == 1 && view != nullptr)
     {
-        const auto input = alert->getTextEditorContents ("FolderInput");
-        if (input.isNotEmpty() && ! input.containsAnyOf ("//\\*"))
+        const auto input = alert->getTextEditorContents ("FolderInput").trim();
+        if (input.isNotEmpty() && ! input.containsAnyOf ("/\\*:?\"<>|"))
         {
             if (! view->getCurrentRoot().getChildFile (input).createDirectory().wasOk())
             {
@@ -70,7 +70,13 @@ static void savePresetCallback (int modalResult, PresetsView* view, juce::Compon
 {
     if (modalResult == 1 && view != nullptr)
     {
-        const auto input = alert->getTextEditorContents ("PresetNameInput");
+        const auto input = alert->getTextEditorContents ("PresetNameInput").trim();
+        if (input.isEmpty() || input.containsAnyOf ("/\\*:?\"<>|"))
+        {
+            juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::AlertIconType::WarningIcon, "Invalid Name", "Name cannot be empty or contain illegal characters.");
+            return;
+        }
+        
         auto discardTransport = ! alert->getToggleState ("keepTransport");
         auto newPreset = view->getCurrentRoot().getChildFile (input + TickUtils::kPresetExtension);
 
@@ -653,15 +659,19 @@ void PresetsView::queryPreset (juce::File fileToQuery, PresetData& dataToFill)
             if (data != nullptr)
             {
                 const auto stateDataToLoad = ValueTree::fromXml (data->readString());
-                dataToFill.name = stateDataToLoad.getProperty (IDs::presetName);
-                auto transport = stateDataToLoad.getChildWithName (IDs::TRANSPORT);
-                dataToFill.uuid = stateDataToLoad.getProperty (IDs::uuid);
-                if (transport.isValid())
+                // Säkerhet: Om zip-filen är skadad och returnerar ogiltig XML, förhindra DAW-krasch!
+                if (stateDataToLoad.isValid())
                 {
-                    dataToFill.containsTime = true;
-                    dataToFill.bpm = transport.getProperty (IDs::bpm, -1);
-                    dataToFill.numerator = transport.getProperty (IDs::numerator, -1);
-                    dataToFill.denumerator = transport.getProperty (IDs::denumerator, -1);
+                    dataToFill.name = stateDataToLoad.getProperty (IDs::presetName);
+                    auto transport = stateDataToLoad.getChildWithName (IDs::TRANSPORT);
+                    dataToFill.uuid = stateDataToLoad.getProperty (IDs::uuid);
+                    if (transport.isValid())
+                    {
+                        dataToFill.containsTime = true;
+                        dataToFill.bpm = transport.getProperty (IDs::bpm, -1);
+                        dataToFill.numerator = transport.getProperty (IDs::numerator, -1);
+                        dataToFill.denumerator = transport.getProperty (IDs::denumerator, -1);
+                    }
                 }
             }
         }

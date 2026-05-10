@@ -176,8 +176,8 @@ void TickAudioProcessor::changeProgramName (int /*index*/, const String& /*newNa
 void TickAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     // Säkerhetsspärr: Garantera alltid en rimlig minimum sample rate vid allokering för att
-    // undvika att minnesbuffertar blir för små vid DAW-quirks eller byten av ljudkort!
-    const double safeSr = juce::jmax(44100.0, sampleRate);
+    // undvika division med noll, men tillåt DAW:s att köra på lägre sample rates (t.ex. 32kHz)
+    const double safeSr = sampleRate > 0.0 ? sampleRate : 44100.0;
     getState().samplerate = safeSr;
     ticks.setSampleRate (safeSr);
     tickState.clear();
@@ -278,48 +278,55 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     // MIDI logging + robust single-tap detection (one rising-edge per controller, per-debounce)
     if (! midiMessages.isEmpty())
     {
+        juce::MidiBuffer passThroughMidi;
+
         for (const auto metadata : midiMessages)
         {
-            // OS-Optimering: Filtrera bort SysEx, stora paket eller trasig data (över 3 eller under 2 bytes)
-            if (metadata.numBytes > 3 || metadata.numBytes < 2)
-                continue;
+            bool isTempoCommand = false;
                 
-            // DSP-Optimering: Läs raw bytes direkt för att undvika instansiering av MidiMessage-objekt!
-            const juce::uint8* data = metadata.data;
-            const int status = data[0] & 0xF0;
-            const int channel = (data[0] & 0x0F) + 1;
-            
-            // --- NY FUNKTION: Universell BPM-mottagning (Kanal 10, 11 & 12) ---
-            // Accepterar Program Change, Note On, och Control Change för att kringgå Cubase-filtrering!
-            if (status == 0xC0 || status == 0x90 || status == 0xB0)
+            if (metadata.numBytes >= 2 && metadata.numBytes <= 3)
             {
-                int val = -1;
-                if (status == 0xC0) val = data[1]; // Program Change
-                else if (status == 0x90 && data[2] > 0) val = data[1]; // Note On (velocity > 0)
-                // Säkerhet: Vid CC, lyssna ENDAST på CC-nummer 119 för att förhindra att Mod-wheel/Volym/Sustain ändrar tempot!
-                else if (status == 0xB0 && data[1] == 119) val = data[2]; // Control Change (CC)
-
-                if (val > 0)
+                // DSP-Optimering: Läs raw bytes direkt för att undvika instansiering av MidiMessage-objekt!
+                const juce::uint8* data = metadata.data;
+                const int status = data[0] & 0xF0;
+                const int channel = (data[0] & 0x0F) + 1;
+                
+                // --- NY FUNKTION: Universell BPM-mottagning (Kanal 10, 11 & 12) ---
+                if (status == 0xC0 || status == 0x90 || status == 0xB0)
                 {
-                    double newBpm = 0.0;
-                    if (channel == 10) newBpm = val;
-                    else if (channel == 11) newBpm = val + 100.0;
-                    else if (channel == 12) newBpm = val + 200.0;
+                    int val = -1;
+                    if (status == 0xC0) val = data[1]; // Program Change
+                    else if (status == 0x90 && metadata.numBytes >= 3 && data[2] > 0) val = data[1]; // Note On (velocity > 0)
+                    else if (status == 0xB0 && metadata.numBytes >= 3 && data[1] == 119) val = data[2]; // Control Change (CC)
 
-                    if (newBpm > 0.0)
+                    if (val > 0 && channel >= 10 && channel <= 12)
                     {
-                    uiUseHost.store(0, std::memory_order_relaxed);
-                    uiBpm.store((float)newBpm, std::memory_order_relaxed);
-                    uiIsPlaying.store(1, std::memory_order_relaxed);
-                    triggerAsyncUpdate();
-                    forceSongRestart = true;
+                        double newBpm = 0.0;
+                        if (channel == 10) newBpm = val;
+                        else if (channel == 11) newBpm = val + 100.0;
+                        else if (channel == 12) newBpm = val + 200.0;
+
+                        if (newBpm > 0.0)
+                        {
+                            isTempoCommand = true; // Markera som förbrukad, skicka ej vidare!
+                            uiUseHost.store(0, std::memory_order_relaxed);
+                            uiBpm.store((float)newBpm, std::memory_order_relaxed);
+                            uiIsPlaying.store(1, std::memory_order_relaxed);
+                            triggerAsyncUpdate();
+                            forceSongRestart = true;
+                        }
+                    }
                 }
             }
+
+            // Släpp igenom alla MIDI-signaler som INTE var metronomens tempo-byten (t.ex Kanal 16)
+            if (! isTempoCommand)
+                passThroughMidi.addEvent (metadata.data, metadata.numBytes, metadata.samplePosition);
         }
         
-        // LIVE SHOW OPTIMERING: Rensa bufferten! Hindra inkommande PC/CC-kommandon från
-        // att "blöda" igenom VST-pluginen och skickas ut till TouchDesigner.
-        midiMessages.clear();
+        // LIVE SHOW OPTIMERING: Byt ut bufferten! Nu stoppar vi tempokommandona från att blöda 
+        // igenom, men vi släpper fram alla ljus-cues och andras MIDI till TouchDesigner!
+        midiMessages.swapWith(passThroughMidi);
     }
 
     // 1. Endast trigga på stigande flank (rising edge) för att undvika dubbel-triggering

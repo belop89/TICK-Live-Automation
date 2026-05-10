@@ -351,8 +351,14 @@ juce::PopupMenu EditBeatView::getAddSamplesMenu (const int replaceIndex)
             auto* entry = samples->getEntry (sampleName + ".wav");
         if (entry != nullptr)
         {
-            auto newTick = std::unique_ptr<Tick> (safeThis->ticks.importAudioStream (sampleName, std::unique_ptr<InputStream> (samples->createStreamForEntry (*entry))));
-            safeThis->setNewImportedSample (replaceIndex, std::move (newTick));
+            auto stream = std::unique_ptr<InputStream> (samples->createStreamForEntry (*entry));
+            // Säkerhet: Förhindra krasch om zip-extraheringen av samplet misslyckas
+            if (stream != nullptr)
+            {
+                auto newTick = std::unique_ptr<Tick> (safeThis->ticks.importAudioStream (sampleName, std::move(stream)));
+                if (newTick != nullptr) // SÄKERHET: Förhindra krasch om ljudfilen är korrupt!
+                    safeThis->setNewImportedSample (replaceIndex, std::move (newTick));
+            }
         }
         });
     }
@@ -376,7 +382,8 @@ juce::PopupMenu EditBeatView::getAddSamplesMenu (const int replaceIndex)
 #else
                                                                                                         auto newTick = std::unique_ptr<Tick> (safeThis->ticks.importAudioFile (chooser.getResult()));
 #endif
-                                                     safeThis->setNewImportedSample (replaceIndex, std::move (newTick));
+                                                     if (newTick != nullptr) // SÄKERHET
+                                                         safeThis->setNewImportedSample (replaceIndex, std::move (newTick));
                                                  }
                                                  safeThis->getTopLevelComponent()->repaint();
                                              }); });
