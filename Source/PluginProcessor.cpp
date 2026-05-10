@@ -295,9 +295,9 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                 const int pcValue = data[1]; // MIDI PC är alltid 0-127
                 double newBpm = 0.0;
                 
-                if (channel == 12 && pcValue > 0) newBpm = pcValue;
-                else if (channel == 13) newBpm = pcValue + 100.0;
-                else if (channel == 14) newBpm = pcValue + 200.0;
+                if (channel == 10 && pcValue > 0) newBpm = pcValue;
+                else if (channel == 11 && pcValue > 0) newBpm = pcValue + 99.0;
+                else if (channel == 12 && pcValue > 0) newBpm = pcValue + 199.0;
 
                 if (newBpm > 0.0)
                 {

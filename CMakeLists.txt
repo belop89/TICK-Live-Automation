@@ -7,6 +7,9 @@ if(POLICY CMP0175)
     cmake_policy(SET CMP0175 OLD)
 endif()
 
+# Säg till CMake att exportera en karta över alla filer för VS Code IntelliSense
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
