@@ -695,7 +695,6 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         
         // DSP-Optimering: Hoista konstanter och variabler som inte förändras utanför while-loopen
         // för att spara cykler i den allra innersta MIDI-genererings-loopen!
-        constexpr double pulseInterval = 1.0 / 24.0;
         const int maxSampleIndex = juce::jmax(0, buffer.getNumSamples() - 1);
 
         // Skicka en klockpuls (0xF8) 24 gånger per fjärdedelsnot
