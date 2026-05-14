@@ -610,6 +610,11 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
             {
                 uiBpm.store(newBpm, std::memory_order_relaxed);
                 triggerAsyncUpdate();
+                    
+                    // DSP-Fix: Håll minnet synkat när DAW:en automatiserar tempot! 
+                    // Annars bryts Host Sync felaktigt i nästa ljudblock.
+                    if (isUseHost)
+                        lastSettingsBpm = newBpm;
             }
         }
     }
@@ -864,11 +869,14 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     // FIX & DSP-Optimering: Processa endast filtret om det faktiskt finns ljud att processa.
     // Auto-Bypass: Om filtret står vidöppet (nära Nyquist), bypassar vi hela DSP-motorn. 
     // Detta sparar värdefull CPU-kraft eftersom ett öppet Low-Pass-filter ändå inte påverkar ljudet!
-    if (safeChannels > 0 && safeSamples > 0 && safeCutoff < (actualSr / 2.0) - 5.0)
+    if (safeChannels > 0 && safeSamples > 0)
     {
         juce::dsp::AudioBlock<float> block (buffer.getArrayOfWritePointers(), safeChannels, safeSamples);
         juce::dsp::ProcessContextReplacing<float> context (block);
-        lpfFilter.process (context);
+        if (safeCutoff < (actualSr / 2.0) - 5.0)
+            lpfFilter.process (context);
+        else
+            lpfFilter.reset(); // Rensa gammalt skräp ur historiken när filtret är öppet!
     }
 
     // DSP-Optimering: Anropa inte 'std::pow' (decibelsToGain) för varje ljudblock!
