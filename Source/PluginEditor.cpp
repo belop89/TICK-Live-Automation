@@ -29,8 +29,18 @@ TickAudioProcessorEditor::TickAudioProcessorEditor (TickAudioProcessor& p)
 #endif
     initAppProperties();
     auto& state = tickProcessor.getState();
-    background.setBufferedToImage (true);
+
+    // GUI-Optimering (Post-OpenGL / Native): Ta bort setBufferedToImage!
+    // Med moderna GPU-API:er (Direct2D/Metal) är det betydligt snabbare att låta grafikkortet 
+    // rita ut komponenten direkt, snarare än att tvinga fram cachade texturer i arbetsminnet.
+    // Detta minskar minnesanvändningen och ger mycket mjukare fönsteromskalningar.
     addAndMakeVisible (background);
+
+    // GUI-Optimering (Post-OpenGL): Markera fönstret som Opaque!
+    // Nu när OpenGL inte kidnappar grafiken måste vi förhindra att OS:et
+    // slösar CPU på att rita osynliga pixlar bakom pluginen.
+    setOpaque (true);
+
     // SÄKERHET: Sätt LookAndFeel LOKALT för just denna instans så att flera TICK-plugins inte kraschar varandra!
     setLookAndFeel (&lookAndFeel); 
 
@@ -162,24 +172,6 @@ TickAudioProcessorEditor::TickAudioProcessorEditor (TickAudioProcessor& p)
         settings.addSectionHeader ("MIDI Note: Other Beats");
         settings.addCustomItem (225, std::move (noteOtherSlider));
         settings.addSeparator();
-#if ! JUCE_IOS && ! JUCE_ANDROID
-        // for standalone props needs to come from it.
-        auto props = standaloneProps != nullptr ? standaloneProps : appProperties.getUserSettings();
-        const auto openGLDefault =
-#if JUCE_MAC
-            false
-#else
-            true
-#endif
-            ;
-        const auto useOpenGL = props->getBoolValue ("opengl", openGLDefault);
-        settings.addItem ("OpenGL Renderer", true, useOpenGL, [this, useOpenGL, props] {
-            props->setValue ("opengl", ! useOpenGL);
-            // this is redundant / do nothing on standalone.
-            appProperties.getUserSettings()->saveIfNeeded();
-            juce::NativeMessageBox::showMessageBoxAsync (MessageBoxIconType::InfoIcon, "Graphic Renderer Changed", "Please re-open UI to apply new renderer.");
-        });
-#endif
         settings.addSeparator();
         settings.addItem ("About", [this] {
             aboutView->setVisible (true);
@@ -243,12 +235,6 @@ TickAudioProcessorEditor::TickAudioProcessorEditor (TickAudioProcessor& p)
     tickProcessor.getState().view.showEditSamples.addListener (this);
     tickProcessor.getState().view.showPresetsView.addListener (this);
 
-#if ! JUCE_IOS
-    auto useOpenGL = appProperties.getUserSettings()->getBoolValue ("opengl", true);
-    if (useOpenGL)
-        openglContext.attachTo (*this);
-#endif
-
 #if JUCE_ANDROID
     RuntimePermissions::request (
         TickUtils::canUseNewerAndroidFileAPI() ? RuntimePermissions::readExternalStorage : RuntimePermissions::writeExternalStorage,
@@ -282,7 +268,12 @@ TickAudioProcessorEditor::TickAudioProcessorEditor (TickAudioProcessor& p)
     setSize (375, 667);
 #endif
 
-    startTimerHz (50);
+    // GUI-Optimering (Post-OpenGL): Höj UI-trådens bilduppdatering till 60 Hz!
+    // Eftersom vi tog bort OpenGL (som hade inbyggd VSync), måste vi nu synka pluginens 
+    // bilduppdatering mot standardfrekvensen för moderna skärmar (60Hz / 120Hz).
+    // Om vi stannar kvar på 50Hz kommer gränssnittet upplevas som ryckigt (frame-pacing judder)
+    // när OS:ets inbyggda fönsterhanterare ritar ut metronomen!
+    startTimerHz (60);
 }
 
 TickAudioProcessorEditor::~TickAudioProcessorEditor()
@@ -292,13 +283,6 @@ TickAudioProcessorEditor::~TickAudioProcessorEditor()
     tickProcessor.getState().view.showEditSamples.removeListener (this);
     tickProcessor.getState().view.showPresetsView.removeListener (this);
     
-    // SÄKERHET: Detach OpenGL-kontexten FÖRST av allt, för att stoppa renderings-tråden
-    // innan vi börjar riva ner (och nollställa LookAndFeel på) komponenterna i gränssnittet. 
-    // Förhindrar sällsynta EXC_BAD_ACCESS grafik-krascher när VST-fönstret stängs!
-#if ! JUCE_IOS
-    openglContext.detach();
-#endif
-
     setLookAndFeel (nullptr); 
 }
 
@@ -529,8 +513,6 @@ void TickAudioProcessorEditor::timerCallback()
 
 void TickAudioProcessorEditor::initAppProperties()
 {
-    // this is copied from juce standalone filter
-    // we 'reuse' this for our opengl toggle.
     PropertiesFile::Options options;
 
     options.applicationName = JucePlugin_Name;

@@ -488,7 +488,7 @@ PerformView::TopBar::TopBar()
 void PerformView::TopBar::resized()
 {
     auto area = getLocalBounds();
-    const auto bpmWidth = tempo.getFont().getStringWidth ("999.99") + 10;
+    const int bpmWidth = (int) tempo.getFont().getStringWidth ("999.99") + 10;
     tempo.setBounds (area.removeFromLeft (bpmWidth));
     auto signatureArea = area.removeFromRight (bpmWidth);
     auto sigWidth = bpmWidth / 2;

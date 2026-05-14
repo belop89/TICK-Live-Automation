@@ -257,7 +257,6 @@ target_compile_definitions(TICK
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
     JUCE_DONT_AUTO_OPEN_MIDI_DEVICES_ON_MOBILE=1
-    JUCE_COREGRAPHICS_RENDER_WITH_MULTIPLE_PAINT_CALLS=1
     JUCE_USE_CUSTOM_PLUGIN_STANDALONE_APP=1
     JUCE_CONTENT_SHARING=1
     # Nätverk: ASIO krävs för Ableton Links asynkrona trådar
@@ -322,7 +321,6 @@ target_link_libraries(TICK
     TickBinaryData
     juce::juce_audio_utils
     juce::juce_dsp
-    juce::juce_opengl
     samplerate
     PUBLIC
     juce::juce_recommended_config_flags

@@ -403,14 +403,12 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     // DSP-Fix: Rensa inte hela bufferten blint! TICK kan användas som en "Insert Effect" 
     // på ett audiospår. Om vi gör buffer.clear() mutar vi DAW:ens inkommande ljud helt.
     // Rensa istället bara de extra utgångar/kanaler som inte har någon faktisk ljud-ingång!
-    auto totalNumInputChannels  = getTotalNumInputChannels();
-    auto totalNumOutputChannels = getTotalNumOutputChannels();
+    const int totalNumInputChannels  = getTotalNumInputChannels();
     
-    // DSP-Säkerhet: Begränsa loopen mot buffer.getNumChannels() för att skydda mot host-buggar
-    // där DAW:en skickar in färre kanaler än vad som registrerades i prepareToPlay!
-    const int safeInChannels = juce::jmin((int)totalNumInputChannels, buffer.getNumChannels());
-    const int safeOutChannels = juce::jmin((int)totalNumOutputChannels, buffer.getNumChannels());
-    for (auto i = safeInChannels; i < safeOutChannels; ++i)
+    // JUCE Standard: Loopa från antalet in-kanaler till antalet allokerade buffert-kanaler.
+    // Detta garanterar att eventuella out-kanaler (som DAW:en lagt till) fylls med tystnad, 
+    // oavsett hur DAW:en hanterar sin asymmetriska I/O-routing!
+    for (auto i = totalNumInputChannels; i < buffer.getNumChannels(); ++i)
         buffer.clear (i, 0, buffer.getNumSamples());
 
     // LIVE SHOW OPTIMERING: Om vi byter låt (PC) eller tappar in tempot när Cubase rullar
@@ -622,6 +620,9 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         {
             uiIsPlaying.store(playheadPosition_.getIsPlaying() ? 1 : 0, std::memory_order_relaxed);
             triggerAsyncUpdate();
+            
+            if (isUseHost)
+                lastSettingsIsPlaying = playheadPosition_.getIsPlaying();
         }
     }
     if (playheadPosition_.getTimeSignature().hasValue())
@@ -714,10 +715,16 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
 
     if (playheadPosition_.getIsPlaying())
     {
+        // DSP-Säkerhet: Skapa en minnesfri vy ("alias") av bufferten som enbart inkluderar
+        // pluginens faktiska utgångskanaler (oftast Stereo). Förhindrar att ljud skrivs in i 
+        // dolda sidechain-kanaler (ifall DAW:en skickat med en 16-kanals buffert)!
+        const int validOutChans = juce::jmin (buffer.getNumChannels(), (int)getTotalNumOutputChannels());
+        juce::AudioBuffer<float> validOutBuffer (buffer.getArrayOfWritePointers(), validOutChans, buffer.getNumSamples());
+
         // DSP-Optimering: Spela ALLTID ut ljudsvansen från det föregående klicket FÖRST,
         // och helt utanför try_lock(). Detta garanterar att ett pågående metronoms-klick 
         // ALDRIG hackar (digitalt pop-ljud), även om GUI-tråden tillfälligt blockerar TicksHolder!
-        tickState.fillTickSample (buffer);
+        tickState.fillTickSample (validOutBuffer);
 
         if (ticks.getLock().try_lock())
         {
@@ -818,7 +825,7 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                     // Kombinera slagvolym och sample-volym för att appliceras effektivt vid mixning
                     tickState.beatGain = beatAssign.gain.get() * ticks[tickIdx].getGain();
                     // FIX: Begränsa läsningen till ljudfilens faktiska längd för att undvika spökecho/skräp-ljud!
-                    tickState.addTickSample (buffer, currentSampleToTick, playLen);
+                    tickState.addTickSample (validOutBuffer, currentSampleToTick, playLen);
 
                     // --- NY FUNKTION: Skicka MIDI-not ut för varje metronom-klick! ---
                     // Användarspecifika noter via inställningarna (Kanal 10 - Trummor)
@@ -984,6 +991,9 @@ void TickAudioProcessor::TickState::fillTickSample (AudioBuffer<float>& bufferTo
 
     if (currentSample < 0)
         return; // not active tick.
+
+    if (sample.getNumChannels() == 0)
+        return; // Säkerhet: Förhindra krasch om sample-bufferten av okänd anledning tömts!
 
     auto constrainedLength = jmin (tickLengthInSamples - currentSample, sample.getNumSamples() - currentSample, bufferToFill.getNumSamples() - tickStartPosition);
     

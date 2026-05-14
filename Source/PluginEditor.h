@@ -116,7 +116,6 @@ private:
     std::unique_ptr<Component> aboutView;
     // Settings
     juce::ApplicationProperties appProperties;
-    juce::OpenGLContext openglContext;
 
     TickAudioProcessor& tickProcessor;
     std::unique_ptr<TickSplash> splash;
