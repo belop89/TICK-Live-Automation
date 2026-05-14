@@ -20,7 +20,9 @@ void TopBar::resized()
     rightButton.setBounds (area.removeFromRight (getHeight()).reduced (TickLookAndFeel::reducePixels * 2));
     if (extendedTopBar)
     {
-        centerLabel.setBounds (area.removeFromLeft (250));
+        // GUI-Säkerhet: Förhindra negativ area om fönstret är extremt litet. 
+        // Detta skyddar BottomBar (Transport) från att få negativa dimensioner och krascha JUCE's rendering!
+        centerLabel.setBounds (area.removeFromLeft (juce::jmin (250, juce::jmax (0, area.getWidth()))));
         extendedBarArea = area;
     }
     else

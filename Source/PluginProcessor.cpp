@@ -405,7 +405,12 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     // Rensa istället bara de extra utgångar/kanaler som inte har någon faktisk ljud-ingång!
     auto totalNumInputChannels  = getTotalNumInputChannels();
     auto totalNumOutputChannels = getTotalNumOutputChannels();
-    for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
+    
+    // DSP-Säkerhet: Begränsa loopen mot buffer.getNumChannels() för att skydda mot host-buggar
+    // där DAW:en skickar in färre kanaler än vad som registrerades i prepareToPlay!
+    const int safeInChannels = juce::jmin((int)totalNumInputChannels, buffer.getNumChannels());
+    const int safeOutChannels = juce::jmin((int)totalNumOutputChannels, buffer.getNumChannels());
+    for (auto i = safeInChannels; i < safeOutChannels; ++i)
         buffer.clear (i, 0, buffer.getNumSamples());
 
     // LIVE SHOW OPTIMERING: Om vi byter låt (PC) eller tappar in tempot när Cubase rullar
@@ -448,13 +453,37 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     // DSP-Optimering: Undvik att anropa '.load()' två gånger på samma atomic-variabel i ljudtråden.
     // Detta sparar CPU-cykler genom att halvera antalet cache-coherency-kontroller över processorkärnorna!
     const int loadedUiHost = uiUseHost.load(std::memory_order_relaxed);
-    const bool isUseHost = loadedUiHost >= 0 ? (loadedUiHost == 1) : settings.useHostTransport.get();
+    
+    // DSP-Säkerhet & Prestanda: Läs in ValueTree-parametrar EN GÅNG per block. ValueTree::get() använder 
+    // interna lås (CriticalSection) som annars kan skapa audio dropouts (sprak) vid frekventa anrop i ljudtråden.
+    const bool currentSettingsUseHost = settings.useHostTransport.get();
+    const float currentSettingsBpm = settings.transport.bpm.get();
+    const bool currentSettingsIsPlaying = settings.transport.isPlaying.get();
+    const int currentSettingsNum = static_cast<int>(settings.transport.numerator.get());
+    const int currentSettingsDenum = static_cast<int>(settings.transport.denumerator.get());
+
+    bool isUseHost = loadedUiHost >= 0 ? (loadedUiHost == 1) : currentSettingsUseHost;
+
+    // GUI-Säkerhet & "Diktator"-läge: Om pluginen följer DAW:en, men användaren 
+    // klickar på Play/Stop inne i VST-gränssnittet, måste vi automatiskt koppla loss 
+    // från DAW:en och byta till Standalone-läge. Annars kommer DAW:en omedelbart 
+    // skriva över knapptrycket och animationen vägrar stanna!
+    if (isUseHost && isHostSyncSupported())
+    {
+        if (currentSettingsIsPlaying != lastSettingsIsPlaying || std::abs(currentSettingsBpm - lastSettingsBpm) > 0.001f)
+        {
+            isUseHost = false;
+            uiUseHost.store(0, std::memory_order_relaxed);
+            triggerAsyncUpdate();
+        }
+    }
+
     if (! isHostSyncSupported() || ! isUseHost)
     {
         const int loadedNum = uiNumerator.load(std::memory_order_relaxed);
-        const int numState = loadedNum >= 0 ? loadedNum : static_cast<int>(settings.transport.numerator.get());
+        const int numState = loadedNum >= 0 ? loadedNum : currentSettingsNum;
         const int loadedDenum = uiDenominator.load(std::memory_order_relaxed);
-        const int denumState = loadedDenum >= 0 ? loadedDenum : static_cast<int>(settings.transport.denumerator.get());
+        const int denumState = loadedDenum >= 0 ? loadedDenum : currentSettingsDenum;
 
         AbletonLink::Requests requests;
         requests.forceBeatAtTime = forceBeatAtTime; // Säg åt nätverket att faslåsa TouchDesigner
@@ -468,7 +497,6 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         else
         {
             // GUI-säkerhet: Detektera om användaren drog i gränssnittet eller laddade en preset
-            const float currentSettingsBpm = settings.transport.bpm.get();
             if (std::abs(currentSettingsBpm - lastSettingsBpm) > 0.001f)
             {
                 if (m_link.isLinkConnected() && std::abs(currentSettingsBpm - (float)playheadPosition_.getBpm().orFallback(120.0)) > 0.001f)
@@ -484,7 +512,6 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         }
         else
         {
-            const bool currentSettingsIsPlaying = settings.transport.isPlaying.get();
             if (currentSettingsIsPlaying != lastSettingsIsPlaying)
             {
                 if (m_link.isLinkConnected() && currentSettingsIsPlaying != playheadPosition_.getIsPlaying())
@@ -496,10 +523,10 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         playheadPosition_.setTimeSignature(AudioPlayHead::TimeSignature ({numState, denumState}));
         
         // Baseline: Tillämpa settings om inte nätverket eller UI har övertaget
-        if (! requests.isPlaying.has_value()) playheadPosition_.setIsPlaying(settings.transport.isPlaying.get());
+        if (! requests.isPlaying.has_value()) playheadPosition_.setIsPlaying(currentSettingsIsPlaying);
         else playheadPosition_.setIsPlaying(*requests.isPlaying);
         
-        if (! requests.bpm.has_value()) playheadPosition_.setBpm(settings.transport.bpm.get());
+        if (! requests.bpm.has_value()) playheadPosition_.setBpm(currentSettingsBpm);
         else playheadPosition_.setBpm(*requests.bpm);
         
         if (! playheadPosition_.getIsPlaying())
@@ -516,9 +543,9 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
             m_link.linkPosition (playheadPosition_, requests);
         }
     }
-    else if (getPlayHead())
+    else if (auto* ph = getPlayHead())
     {
-        playheadPosition_ = getPlayHead()->getPosition().orFallback(AudioPlayHead::PositionInfo());
+        playheadPosition_ = ph->getPosition().orFallback(AudioPlayHead::PositionInfo());
         
         // --- NY FUNKTION: DAW-to-Link Bridge ---
         // Om TICK är inställd på att följa Cubase, tvinga ut Cubase-tempot och Play/Stop 
@@ -531,16 +558,33 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
             const double hostBpm = juce::jmax(20.0, playheadPosition_.getBpm().orFallback(120.0));
             const bool hostIsPlaying = playheadPosition_.getIsPlaying();
             
+            bool needsPush = false;
+
             // Endast pusha om DAW-tempot ändras för att inte spamma nätverket
             if (std::abs(hostBpm - lastSettingsBpm) > 0.01 || hostIsPlaying != lastSettingsIsPlaying)
             {
                 hostRequests.bpm = hostBpm;
                 hostRequests.isPlaying = hostIsPlaying;
-                
-                // Använd en dummy-pos så Link inte manipulerar tillbaka vår Cubase-tidslinje!
-                juce::AudioPlayHead::PositionInfo dummyPos = playheadPosition_;
-                m_link.linkPosition (dummyPos, hostRequests);
-                
+                needsPush = true;
+            }
+
+            // LÖSNING PÅ STARTORDNINGS-PROBLEMET (Late-Joiners):
+            // Om Cubase startar uppspelningen, ELLER om vi byter låt/tappar tempo, MÅSTE 
+            // vi tvinga ut Cubase exakta tidslinje (Phase) på nätverket. Då kommer TouchDesigner 
+            // omedelbart att snäppa in i rätt fas, oavsett om det startades före eller efter Cubase!
+            if ((hostIsPlaying && !lastSettingsIsPlaying) || forceSongRestart || tapTriggered)
+            {
+                hostRequests.forceBeatAtTime = playheadPosition_.getPpqPosition().orFallback(0.0);
+                needsPush = true;
+            }
+
+            // Låt Ableton Link-motorn kontinuerligt övervaka nätverket!
+            // Använd en dummy-pos så Link inte manipulerar tillbaka vår Cubase-tidslinje.
+            juce::AudioPlayHead::PositionInfo dummyPos = playheadPosition_;
+            m_link.linkPosition (dummyPos, hostRequests);
+
+            if (needsPush)
+            {
                 lastSettingsBpm = (float)hostBpm;
                 lastSettingsIsPlaying = hostIsPlaying;
             }
@@ -561,7 +605,7 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     if (playheadPosition_.getBpm().hasValue())
     {
         const float newBpm = (float) *playheadPosition_.getBpm();
-        if (std::abs(settings.transport.bpm.get() - newBpm) > 0.01f)
+        if (std::abs(currentSettingsBpm - newBpm) > 0.01f)
         {
             // Läs av UI:t igen så vi inte skriver över en pågående tap/rattning
             if (uiBpm.load(std::memory_order_relaxed) < 0.0f)
@@ -572,7 +616,7 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         }
     }
     // Håll koll om Ableton Link startar/stoppar nätverket utifrån (TouchDesigner)
-    if (playheadPosition_.getIsPlaying() != settings.transport.isPlaying.get())
+    if (playheadPosition_.getIsPlaying() != currentSettingsIsPlaying)
     {
         if (uiIsPlaying.load(std::memory_order_relaxed) < 0)
         {
@@ -583,12 +627,12 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     if (playheadPosition_.getTimeSignature().hasValue())
     {
         const auto ts = *playheadPosition_.getTimeSignature();
-        if (settings.transport.numerator.get() != ts.numerator)
+        if (currentSettingsNum != ts.numerator)
         {
             uiNumerator.store(ts.numerator, std::memory_order_relaxed);
             triggerAsyncUpdate();
         }
-        if (settings.transport.denumerator.get() != ts.denominator)
+        if (currentSettingsDenum != ts.denominator)
         {
             uiDenominator.store(ts.denominator, std::memory_order_relaxed);
             triggerAsyncUpdate();
@@ -649,6 +693,11 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         // Beräkna var i denna buffer (PPQ) vi befinner oss
         double bufEndPpq = currentPpq + (buffer.getNumSamples() / samplesPerQuarter);
         
+        // DSP-Optimering: Hoista konstanter och variabler som inte förändras utanför while-loopen
+        // för att spara cykler i den allra innersta MIDI-genererings-loopen!
+        constexpr double pulseInterval = 1.0 / 24.0;
+        const int maxSampleIndex = juce::jmax(0, buffer.getNumSamples() - 1);
+
         // Skicka en klockpuls (0xF8) 24 gånger per fjärdedelsnot
         while (nextClockPpq < bufEndPpq)
         {
@@ -656,12 +705,11 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
             int sampleOffset = juce::roundToInt(ppqOffset * samplesPerQuarter);
             
             // Säkerhet: Förhindra krasch om DAW skickar flush-block med 0 samples
-            int maxSampleIndex = juce::jmax(0, buffer.getNumSamples() - 1);
             sampleOffset = juce::jlimit(0, maxSampleIndex, sampleOffset);
             
             const juce::uint8 midiClockData[1] = { 0xF8 };
             midiMessages.addEvent(midiClockData, 1, sampleOffset);
-            nextClockPpq += (1.0 / 24.0);
+            nextClockPpq += pulseInterval;
         }
     }
 
@@ -707,10 +755,19 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         auto ppqPosInBuf = ppqOffset;
         auto currentSampleToTick = 0;
 
+        // SAMPLE-ACCURATE PRECOUNT FIX: 
+        // Om handlePreCount precis stängde av metronomen (satte uiIsPlaying till 0), 
+        // blockerar vi omedelbart fler ticks i ljudtråden. Annars hinner metronomen 
+        // spela ett felaktigt klick på "Ettan" i låten innan UI-tråden hinner reagera!
+        if (uiIsPlaying.load(std::memory_order_relaxed) == 0)
+            ppqToBufEnd = -1.0;
+
         // reset tick state
         tickState.tickStartPosition = 0;
 
-        if (ppqFromBufStart == 0.0)
+        // DSP-Optimering: Använd ett epsilon istället för "== 0.0". DAW:s tidslinjer lider ofta av 
+        // mikroskopiska flyttalsfel (t.ex. 0.00000001). Detta garanterar sample-exakt precision!
+        if (ppqFromBufStart < 0.0001)
         {
             ppqPosInBuf = 0.0;
         }
@@ -798,8 +855,10 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     size_t safeChannels = (size_t) juce::jmax(0, numChannels);
     size_t safeSamples = (size_t) juce::jmax(0, buffer.getNumSamples());
     
-    // FIX: Processa endast filtret om det faktiskt finns ljud att processa! Förhindrar Memory Access Violation.
-    if (safeChannels > 0 && safeSamples > 0)
+    // FIX & DSP-Optimering: Processa endast filtret om det faktiskt finns ljud att processa.
+    // Auto-Bypass: Om filtret står vidöppet (nära Nyquist), bypassar vi hela DSP-motorn. 
+    // Detta sparar värdefull CPU-kraft eftersom ett öppet Low-Pass-filter ändå inte påverkar ljudet!
+    if (safeChannels > 0 && safeSamples > 0 && safeCutoff < (actualSr / 2.0) - 5.0)
     {
         juce::dsp::AudioBlock<float> block (buffer.getArrayOfWritePointers(), safeChannels, safeSamples);
         juce::dsp::ProcessContextReplacing<float> context (block);
@@ -827,7 +886,7 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     // LIVE SHOW OPTIMERING: Avancera standalone-tidslinjen HÄR i slutet av blocket!
     // BARA om Ableton Link INTE är anslutet. Är Link anslutet sköter nätverket all tid!
     // Annars dubbel-avancerar vi och skapar massivt jitter mot TouchDesigner.
-    if (! isHostSyncSupported() || ! getState().useHostTransport.get())
+    if (! isHostSyncSupported() || ! currentSettingsUseHost)
     {
         if (playheadPosition_.getIsPlaying() && ! m_link.isLinkConnected())
         {
@@ -854,8 +913,18 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     const int currentBeatForUI = juce::roundToInt (floor (fmod ((posForUI + 0.0001) / ttqForUI, safeNumeratorUI))) + 1;
 
     auto subDivForUI = fmod (posForUI, ttqForUI) / ttqForUI;
-    uiCurrentBeatPos.store(currentBeatForUI + subDivForUI, std::memory_order_relaxed);
-    uiCurrentBeat.store(currentBeatForUI, std::memory_order_relaxed);
+    
+    // FIX: Nollställ UI-animationen HÄR också om vi är stoppade, annars fastnar färgerna i UI:t!
+    if (!playheadPosition_.getIsPlaying()) 
+    {
+        uiCurrentBeatPos.store(0.0, std::memory_order_relaxed);
+        uiCurrentBeat.store(0, std::memory_order_relaxed);
+    }
+    else
+    {
+        uiCurrentBeatPos.store(currentBeatForUI + subDivForUI, std::memory_order_relaxed);
+        uiCurrentBeat.store(currentBeatForUI, std::memory_order_relaxed);
+    }
 }
 
 //==============================================================================

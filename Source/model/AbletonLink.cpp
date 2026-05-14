@@ -48,6 +48,23 @@ void AbletonLink::linkPosition (juce::AudioPlayHead::PositionInfo& posInfo, cons
     // Vi måste konvertera DAW:ens taktart (ex 6/8 eller 7/8) till exakta fjärdedelsnoter, annars roterar TouchDesigner i fel hastighet!
     const double quantum = juce::jmax (1.0, (4.0 / juce::jmax(1, ts.denominator)) * ts.numerator);
 
+    // --- AUTOMATISK LATE-JOINER SYNK ("ABSOLUTE MASTER WATCHDOG") ---
+    // Om TouchDesigner startas efter TICK kan nätverkets fas hamna ur synk.
+    // TICK mäter kontinuerligt nätverkets fas mot Cubase fas. Om nätverket
+    // driver mer än 0.1 slag (för att tillåta vanlig audio-jitter), slår TICK 
+    // omedelbart tillbaka och tvingar in hela nätverket i Cubase exakta fas!
+    if (posInfo.getIsPlaying())
+    {
+        const double linkBeat = sessionState.beatAtTime (time, quantum);
+        const double hostBeat = posInfo.getPpqPosition().orFallback(0.0);
+        
+        if (std::abs(linkBeat - hostBeat) > 0.1)
+        {
+            sessionState.requestBeatAtTime (hostBeat, time, quantum);
+            stateChanged = true;
+        }
+    }
+
     if (requests.forceBeatAtTime.has_value())
     {
         sessionState.requestBeatAtTime (*requests.forceBeatAtTime, time, quantum);
@@ -78,7 +95,10 @@ void AbletonLink::linkPosition (juce::AudioPlayHead::PositionInfo& posInfo, cons
 
     // Hämta tillbaka den synkade nätverkstiden för metronom-klicket
     posInfo.setBpm (sessionState.tempo());
-    posInfo.setIsPlaying (sessionState.isPlaying());
+    
+    // Diktator-läge: Vi låter INTE Ableton Link (TouchDesigner) diktera om vi spelar eller inte!
+    // Om TD är igång och tvingar nätverket till 'Play', ignorerar vi det och behåller vår egen kontroll.
+    // posInfo.setIsPlaying (sessionState.isPlaying());
     
     // SÄKERHET (Phase-lock): Lås även ljudklickets "Etta" (Bar Start) till 
     // Link-nätverkets matematiska fas för att förhindra drift mot lasern i TD!

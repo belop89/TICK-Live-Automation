@@ -142,13 +142,21 @@ void PerformView::resized()
 
 void PerformView::update (double currentPos)
 {
+    // GUI-Optimering: Läs av ValueTree-parametrar EN GÅNG i början av uppdateringen.
+    // Eftersom update() körs 50 gånger i sekunden undviker vi att låsa och söka i trädet 
+    // upprepade gånger per frame, vilket gör gränssnittet blixtsnabbt och sparar CPU!
+    const int currentNum = state.transport.numerator.get();
+    const int currentDenum = state.transport.denumerator.get();
+    const bool isPlaying = state.transport.isPlaying.get();
+    const float currentBpm = state.transport.bpm.get();
+
     // Säkerhetsspärr: Förhindra Memory Access Violation om DAW:en skickar extrema taktartsvärden (>64)
-    const auto numOfBeats = juce::jlimit(1, (int)TickSettings::kMaxBeatAssignments, state.transport.numerator.get());
+    const auto numOfBeats = juce::jlimit(1, (int)TickSettings::kMaxBeatAssignments, currentNum);
     
     // GUI-Optimering/Fix: Jämför INTE beatsInRow direkt med denumrator! Vid udda taktarter (ex 3/8) 
     // låstes de i ojämlikhet (3 != 8), vilket orsakade en evighetsloop där gränssnittet raderades 
     // och heap-allokerades 50 gånger i sekunden!
-    const int expectedBeatsInRow = juce::jlimit (1, 8, juce::jmin (state.transport.numerator.get(), state.transport.denumerator.get()));
+    const int expectedBeatsInRow = juce::jlimit (1, 8, juce::jmin (currentNum, currentDenum));
     const bool layoutChanged = (beatsInRow != expectedBeatsInRow);
     
     if ((size_t) numOfBeats != beats.size() || layoutChanged)
@@ -166,9 +174,12 @@ void PerformView::update (double currentPos)
         }
         resized();
     }
-    const auto beatPosExclusive = std::max<double> (0, currentPos - 1.0);
+    // GUI-Fix: Lägg till epsilon (0.0001) för att förhindra att flyttalsavrundning från 
+    // atomics orsakar att animationen "blinkar till" på föregående slag just innan nästa slag börjar!
+    const auto beatPosExclusive = std::max<double> (0, currentPos - 1.0 + 0.0001);
     const auto currentBeat = floor (beatPosExclusive);
     const auto barPos = beatPosExclusive - currentBeat;
+    
     for (size_t num = 0; num < (size_t) numOfBeats; num++)
     {
         auto& beat = *beats[num];
@@ -176,12 +187,15 @@ void PerformView::update (double currentPos)
         const bool wasCurrent = beat.isCurrent;
         const float oldPos = beat.relativePos;
 
-        beat.isOn = num < currentBeat;
-        beat.isCurrent = num == currentBeat;
-        beat.relativePos = static_cast<float> (beat.isCurrent ? barPos : 0.0);
-        if (wasOn != beat.isOn || wasCurrent != beat.isCurrent || beat.relativePos != oldPos)
+        beat.isOn = isPlaying && (num < currentBeat);
+        beat.isCurrent = isPlaying && (num == currentBeat);
+        beat.relativePos = static_cast<float> (beat.isCurrent ? barPos : 0.0f);
+
+        // GUI-Optimering: Förhindra onödiga repaints för sub-pixel-förändringar. Sparar massivt 
+        // med GPU/CPU eftersom små flyttals-differenser (< 0.005) ändå inte syns för blotta ögat!
+        if (wasOn != beat.isOn || wasCurrent != beat.isCurrent || std::abs(beat.relativePos - oldPos) > 0.005f)
             beat.repaint();
-        if (state.transport.isPlaying.get() && ! isEditMode && beat.isCurrent && (viewport.getViewArea().getBottom() < beat.getY() || viewport.getViewArea().getY() > beat.getY()))
+        if (isPlaying && ! isEditMode && beat.isCurrent && (viewport.getViewArea().getBottom() < beat.getY() || viewport.getViewArea().getY() > beat.getY()))
         {
             viewport.setViewPosition (0, beat.getY());
         }
@@ -190,16 +204,24 @@ void PerformView::update (double currentPos)
     
     // GUI-Optimering: Använd komponentens inbyggda property-minne för att slippa anropa 
     // getText() som annars skapar heap-allokeringar (juce::String) 50 gånger i sekunden per instans!
-    const float currentBpm = state.transport.bpm.get();
-    const float lastBpm = topBar.tempo.getProperties().getWithDefault("lastBpm", -1.0f);
+    static const juce::Identifier lastBpmId("lastBpm");
+    const float lastBpm = topBar.tempo.getProperties().getWithDefault(lastBpmId, -1.0f);
     
-    if (topBar.tempo.isEnabled() != isStandalone || std::abs(currentBpm - lastBpm) > 0.01f)
+    static const juce::Identifier lastNumId("lastNum");
+    const int lastNum = topBar.num.getProperties().getWithDefault(lastNumId, -1);
+
+    static const juce::Identifier lastDenumId("lastDenum");
+    const int lastDenum = topBar.denum.getProperties().getWithDefault(lastDenumId, -1);
+
+    if (topBar.tempo.isEnabled() != isStandalone || std::abs(currentBpm - lastBpm) > 0.01f || currentNum != lastNum || currentDenum != lastDenum)
     {
-        topBar.tempo.getProperties().set("lastBpm", currentBpm);
+        topBar.tempo.getProperties().set(lastBpmId, currentBpm);
+        topBar.num.getProperties().set(lastNumId, currentNum);
+        topBar.denum.getProperties().set(lastDenumId, currentDenum);
         
         topBar.tempo.setDescription (juce::String (currentBpm) + "BPM");
-        topBar.num.setDescription (juce::String (state.transport.numerator.get()) + " beats numerator");
-        topBar.denum.setDescription (juce::String (state.transport.denumerator.get()) + " beats denumerator");
+        topBar.num.setDescription (juce::String (currentNum) + " beats numerator");
+        topBar.denum.setDescription (juce::String (currentDenum) + " beats denumerator");
         topBar.tempo.setEnabled (isStandalone);
         topBar.num.setEnabled (isStandalone);
         topBar.denum.setEnabled (isStandalone);

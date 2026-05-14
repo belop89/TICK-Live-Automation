@@ -341,10 +341,6 @@ void TickAudioProcessorEditor::resized()
     topBar.removeChildComponent (&bottomBar);
     removeChildComponent (&bottomBar);
 
-    // OS-Fix: Använd '&&' istället för '||' för att regeln ska fungera logiskt.
-#if ! JUCE_IOS && ! JUCE_ANDROID
-    tickProcessor.getState().view.windowSize.setValue (String (getWidth()) + "," + String (getHeight()));
-#endif
     auto safeArea = Desktop::getInstance().getDisplays().getPrimaryDisplay()->safeAreaInsets;
     constexpr auto notchSafeSides = 32; // we are always being safe...
     const auto isRotatedAndNeeded =
@@ -471,6 +467,22 @@ void TickAudioProcessorEditor::valueChanged (juce::Value& value)
 
 void TickAudioProcessorEditor::timerCallback()
 {
+    // GUI-Optimering: Spara fönsterstorleken i bakgrunden istället för i resized().
+    // Att göra detta i resized() skapar hundratals ValueTree-uppdateringar och String-allokeringar 
+    // per sekund när användaren drar i fönstrets hörn, vilket annars orsakar massivt lagg i UI:t!
+#if ! JUCE_IOS && ! JUCE_ANDROID
+    const int currentW = getWidth();
+    const int currentH = getHeight();
+    static const juce::Identifier lastWId("lastW");
+    static const juce::Identifier lastHId("lastH");
+    if (currentW > 0 && currentH > 0 && (currentW != (int)getProperties().getWithDefault(lastWId, 0) || currentH != (int)getProperties().getWithDefault(lastHId, 0)))
+    {
+        getProperties().set(lastWId, currentW);
+        getProperties().set(lastHId, currentH);
+        tickProcessor.getState().view.windowSize.setValue (juce::String (currentW) + "," + juce::String (currentH));
+    }
+#endif
+
     const bool useHostTransport = tickProcessor.getState().useHostTransport.get();
     const int preCount = tickProcessor.getState().transport.preCount.get();
     performView->update (tickProcessor.getCurrentBeatPos());
@@ -485,13 +497,14 @@ void TickAudioProcessorEditor::timerCallback()
     {
             // GUI-Optimering: Skapa inte nya strängar och anropa text-uppdateringar 50 gånger i sekunden
             // om värdet inte faktiskt har ändrats.
-            const int lastPreCount = bottomBar.preCountIndicator.getProperties().getWithDefault("lastPre", -1);
+            static const juce::Identifier lastPreId("lastPre");
+            const int lastPreCount = bottomBar.preCountIndicator.getProperties().getWithDefault(lastPreId, -1);
             if (preCount != lastPreCount)
             {
                 const char* preStrs[] = { "0BAR", "1BAR", "2BAR", "3BAR", "4BAR" };
                 const juce::String preStr = (preCount >= 0 && preCount <= 4) ? juce::String(preStrs[preCount]) : (juce::String (preCount) + "BAR");
                 bottomBar.preCountIndicator.setButtonText (preStr);
-                bottomBar.preCountIndicator.getProperties().set("lastPre", preCount);
+                bottomBar.preCountIndicator.getProperties().set(lastPreId, preCount);
             }
     }
     const auto link = tickProcessor.m_link.isLinkConnected();
@@ -504,11 +517,12 @@ void TickAudioProcessorEditor::timerCallback()
         // GUI-Optimering: Förhindra att Timecode-strängen allokeras (vilket skapar heap-skräp) 
         // 50 gånger i sekunden när DAW:en står stilla!
         const double currentSecs = tickProcessor.playheadPosition_.getTimeInSeconds().orFallback(0.0);
-        const double lastSecs = bottomBar.transportPosition.getProperties().getWithDefault("lastSecs", -1.0);
+        static const juce::Identifier lastSecsId("lastSecs");
+        const double lastSecs = bottomBar.transportPosition.getProperties().getWithDefault(lastSecsId, -1.0);
         if (std::abs(currentSecs - lastSecs) > 0.001)
         {
             bottomBar.transportPosition.setText (TickUtils::generateTimecodeDisplay (tickProcessor.playheadPosition_), dontSendNotification);
-            bottomBar.transportPosition.getProperties().set("lastSecs", currentSecs);
+            bottomBar.transportPosition.getProperties().set(lastSecsId, currentSecs);
         }
     }
 }
