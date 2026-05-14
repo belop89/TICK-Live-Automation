@@ -97,6 +97,9 @@ TickAudioProcessor::TickAudioProcessor()
     // Default till Play-läge direkt vid inladdning
     settings.transport.isPlaying.setValue(true, nullptr);
     uiIsPlaying.store(1, std::memory_order_relaxed);
+
+    lastSettingsBpm = settings.transport.bpm.get();
+    lastSettingsIsPlaying = settings.transport.isPlaying.get();
 }
 
 TickAudioProcessor::~TickAudioProcessor()
@@ -181,6 +184,14 @@ void TickAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     getState().samplerate = safeSr;
     ticks.setSampleRate (safeSr);
     tickState.clear();
+    
+    // DSP-Fix: Initiera gain-värden för att förhindra ett digitalt "klick" (fade-in/out) 
+    // på det allra första ljudblocket när DAW:en startar uppspelningen!
+    lastMasterGainDb = masterGain->load(std::memory_order_relaxed);
+    masterGainMultiplier = juce::Decibels::decibelsToGain (lastMasterGainDb);
+
+    // DSP-Optimering: Pre-allokera MIDI-bufferten tillräckligt stor för att garantera noll mallocs i ljudtråden!
+    passThroughMidi.ensureSize(8192);
 
     // Preallokera upp till 10 sekunder för tick-samplet för att undvika 'makeCopyOf' (malloc) i on the fly
     tickState.sample.setSize(1, (int)(safeSr * 10.0));
@@ -247,7 +258,9 @@ void TickAudioProcessor::handlePreCount (const double inputPPQ)
     const auto ts = playheadPosition_.getTimeSignature().orFallback (AudioPlayHead::TimeSignature ({ 1, 4 }));
     const auto ttq = (4.0 / juce::jmax(1, ts.denominator)); // tick to quarter (säkerhetsspärr)
     const auto expectedBar = std::floor (inputPPQ / ttq / juce::jmax(1, ts.numerator)); // Säkerhetsspärr
-    if ((int)expectedBar == preCount)
+    // DSP-Säkerhet: Använd >= istället för ==. Om ett stort ljudblock hoppar förbi exakt heltal
+    // förhindrar detta att inräkningen missar stoppet och metronomen fortsätter spela i all evighet!
+    if ((int)expectedBar >= preCount)
     {
         uiIsPlaying.store(0, std::memory_order_relaxed);
         triggerAsyncUpdate();
@@ -259,6 +272,12 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
 {
 
     ScopedNoDenormals noDenormals; // ENDAST DENNA RAD SKA VARA KVAR
+    
+    // DSP-Optimering: Tvinga hostens (DAW:ens) MIDI-buffer att ha tillräcklig kapacitet!
+    // Vissa DAW:s skickar in buffertar med 0 bytes minneskapacitet om inga inkommande noter finns.
+    // När vi sedan fyller på med våra egna 24 MIDI-klockpulser per fjärdedelsnot, tvingas bufferten
+    // utföra dolda RAM-allokeringar (malloc) på ljudtråden. Detta förhindrar det helt!
+    midiMessages.ensureSize(2048);
 
     // 0. OS-Optimering: Hämta aktuell tid en enda gång per ljudblock för att undvika onödiga systemanrop
     const uint32_t blockTimeMs = juce::Time::getMillisecondCounter();
@@ -278,7 +297,7 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     // MIDI logging + robust single-tap detection (one rising-edge per controller, per-debounce)
     if (! midiMessages.isEmpty())
     {
-        juce::MidiBuffer passThroughMidi;
+        passThroughMidi.clear();
 
         for (const auto metadata : midiMessages)
         {
@@ -299,7 +318,25 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                     else if (status == 0x90 && metadata.numBytes >= 3 && data[2] > 0) val = data[1]; // Note On (velocity > 0)
                     else if (status == 0xB0 && metadata.numBytes >= 3 && data[1] == 119) val = data[2]; // Control Change (CC)
 
-                    if (val > 0 && channel >= 10 && channel <= 12)
+                    // --- NY FUNKTION: Helix Tap Tempo Direkt via MIDI ---
+                    // Låter TICK lyssna på CC 64 (Sustain) direkt från Helix som en Tap-knapp!
+                    // Säkerhet: Begränsa till Kanal 10-12 så inte vanliga keyboard-pedaler (Kanal 1) förstör tempot!
+                    if (status == 0xB0 && metadata.numBytes >= 3 && data[1] == 64 && channel >= 10 && channel <= 12)
+                    {
+                        isTempoCommand = true; // Förbruka alltid signalen så den inte blöder igenom
+                        const bool currentMidiTapState = (data[2] >= 64);
+                        
+                        // Säkerhet: Edge-Detection för att förhindra att kontinuerliga pedaler spammar metronomen!
+                        if (currentMidiTapState && !lastMidiCC64State)
+                        {
+                            if (handleTapTempo(blockTimeMs))
+                                tapTriggered = true;
+                        }
+                        lastMidiCC64State = currentMidiTapState;
+                    }
+                // FIX: Ändra val > 0 till val >= 0. Annars ignoreras Program Change 0 på Kanal 11 och 12
+                // vilket skapade ett "svart hål" där metronomen vägrade byta till exakt 100 BPM eller 200 BPM!
+                else if (val >= 0 && channel >= 10 && channel <= 12)
                     {
                         double newBpm = 0.0;
                         if (channel == 10) newBpm = val;
@@ -314,6 +351,10 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                             uiIsPlaying.store(1, std::memory_order_relaxed);
                             triggerAsyncUpdate();
                             forceSongRestart = true;
+                            
+                            // Logik-Fix: Rensa Tap-minnet så att Helix-pedalen inte blockeras 
+                            // av sitt eget "drift-skydd" ifall den nya låten har ett drastiskt annorlunda tempo!
+                            ticks.tapModel.clear();
                         }
                     }
                 }
@@ -324,9 +365,11 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                 passThroughMidi.addEvent (metadata.data, metadata.numBytes, metadata.samplePosition);
         }
         
-        // LIVE SHOW OPTIMERING: Byt ut bufferten! Nu stoppar vi tempokommandona från att blöda 
-        // igenom, men vi släpper fram alla ljus-cues och andras MIDI till TouchDesigner!
-        midiMessages.swapWith(passThroughMidi);
+        // DSP-Optimering: Använd INTE swapWith()! Det byter ut din 8192-bytes pre-allokerade buffer 
+        // mot DAW:ens lilla buffer, vilket förstör optimeringen och skapar 'mallocs' på ljudtråden.
+        // Använd clear() och addEvents() för att säkert kopiera in datan istället!
+        midiMessages.clear();
+        midiMessages.addEvents(passThroughMidi, 0, -1, 0);
     }
 
     // 1. Endast trigga på stigande flank (rising edge) för att undvika dubbel-triggering
@@ -357,7 +400,13 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         }
     }
 
-    buffer.clear();
+    // DSP-Fix: Rensa inte hela bufferten blint! TICK kan användas som en "Insert Effect" 
+    // på ett audiospår. Om vi gör buffer.clear() mutar vi DAW:ens inkommande ljud helt.
+    // Rensa istället bara de extra utgångar/kanaler som inte har någon faktisk ljud-ingång!
+    auto totalNumInputChannels  = getTotalNumInputChannels();
+    auto totalNumOutputChannels = getTotalNumOutputChannels();
+    for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
+        buffer.clear (i, 0, buffer.getNumSamples());
 
     // LIVE SHOW OPTIMERING: Om vi byter låt (PC) eller tappar in tempot när Cubase rullar
     if (forceSongRestart)
@@ -365,13 +414,19 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         // TD-Optimering: Skicka 'Stop' innan 'Start' om vi redan spelar. Vissa noder 
         // i TouchDesigner vägrar nollställa sin tidslinje om de inte först får ett Stop-kommando!
         if (wasPlaying)
-            midiMessages.addEvent(juce::MidiMessage::midiStop(), 0);
+        {
+            // DSP-Optimering: Skicka RAW byte 0xFC (Stop) för att undvika instansiering
+            const juce::uint8 midiStopData[1] = { 0xFC };
+            midiMessages.addEvent(midiStopData, 1, 0);
+        }
 
         playheadPosition_.setPpqPosition(0.0);
         playheadPosition_.setTimeInSamples(0);
         playheadPosition_.setTimeInSeconds(0.0);
         nextClockPpq = 0.0;
-        midiMessages.addEvent(juce::MidiMessage::midiStart(), 0);
+        // DSP-Optimering: Skicka RAW byte 0xFA (Start) för att undvika instansiering
+        const juce::uint8 midiStartData[1] = { 0xFA };
+        midiMessages.addEvent(midiStartData, 1, 0);
         wasPlaying = true; // Förhindra dubbla midiStart längre ner
     }
     else if (tapTriggered)
@@ -382,29 +437,71 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         playheadPosition_.setPpqPosition(snapped);
         nextClockPpq = snapped; // Resynca klockan så den inte spottar ut en "burst" av pulser
     }
+    
+    // Pusha Fas-låsning via Ableton Link om vi tappar pedalen eller byter låt
+    std::optional<double> forceBeatAtTime;
+    if (forceSongRestart) forceBeatAtTime = 0.0;
+    else if (tapTriggered) forceBeatAtTime = playheadPosition_.getPpqPosition().orFallback(0.0);
 
     // standalone mode
     // Läs in aktuellt state, och applicera UI-brevlådan DIREKT för noll latens om den har nytt data!
-    const bool isUseHost = uiUseHost.load(std::memory_order_relaxed) >= 0 ? uiUseHost.load(std::memory_order_relaxed) == 1 : settings.useHostTransport.get();
+    // DSP-Optimering: Undvik att anropa '.load()' två gånger på samma atomic-variabel i ljudtråden.
+    // Detta sparar CPU-cykler genom att halvera antalet cache-coherency-kontroller över processorkärnorna!
+    const int loadedUiHost = uiUseHost.load(std::memory_order_relaxed);
+    const bool isUseHost = loadedUiHost >= 0 ? (loadedUiHost == 1) : settings.useHostTransport.get();
     if (! isHostSyncSupported() || ! isUseHost)
     {
-#if JUCE_IOS
+        const int loadedNum = uiNumerator.load(std::memory_order_relaxed);
+        const int numState = loadedNum >= 0 ? loadedNum : static_cast<int>(settings.transport.numerator.get());
+        const int loadedDenum = uiDenominator.load(std::memory_order_relaxed);
+        const int denumState = loadedDenum >= 0 ? loadedDenum : static_cast<int>(settings.transport.denumerator.get());
+
         AbletonLink::Requests requests;
-        if (playheadPosition_.getIsPlaying() != settings.transport.isPlaying.get())
-            requests.isPlaying = settings.transport.isPlaying.get();
+        requests.forceBeatAtTime = forceBeatAtTime; // Säg åt nätverket att faslåsa TouchDesigner
+        
+        // Pusha ENDAST tempo till nätverket om DU aktivt ändrat tempot via Helix/UI!
+        const float currentUiBpm = uiBpm.load(std::memory_order_relaxed);
+        if (currentUiBpm >= 0.0f) 
+        {
+            requests.bpm = currentUiBpm;
+        }
+        else
+        {
+            // GUI-säkerhet: Detektera om användaren drog i gränssnittet eller laddade en preset
+            const float currentSettingsBpm = settings.transport.bpm.get();
+            if (std::abs(currentSettingsBpm - lastSettingsBpm) > 0.001f)
+            {
+                if (m_link.isLinkConnected() && std::abs(currentSettingsBpm - (float)playheadPosition_.getBpm().orFallback(120.0)) > 0.001f)
+                    requests.bpm = currentSettingsBpm;
+                lastSettingsBpm = currentSettingsBpm;
+            }
+        }
+            
+        const int currentUiIsPlaying = uiIsPlaying.load(std::memory_order_relaxed);
+        if (currentUiIsPlaying >= 0) 
+        {
+            requests.isPlaying = (currentUiIsPlaying == 1);
+        }
+        else
+        {
+            const bool currentSettingsIsPlaying = settings.transport.isPlaying.get();
+            if (currentSettingsIsPlaying != lastSettingsIsPlaying)
+            {
+                if (m_link.isLinkConnected() && currentSettingsIsPlaying != playheadPosition_.getIsPlaying())
+                    requests.isPlaying = currentSettingsIsPlaying;
+                lastSettingsIsPlaying = currentSettingsIsPlaying;
+            }
+        }
 
-        if (playheadPosition_.getBpm().hasValue() && *playheadPosition_.getBpm() != settings.transport.bpm.get())
-            requests.bpm = settings.transport.bpm.get();
-#endif
-
-        const bool isPlayingState = uiIsPlaying.load(std::memory_order_relaxed) >= 0 ? (uiIsPlaying.load(std::memory_order_relaxed) == 1) : static_cast<bool>(settings.transport.isPlaying.get());
-        const int numState = uiNumerator.load(std::memory_order_relaxed) >= 0 ? uiNumerator.load(std::memory_order_relaxed) : static_cast<int>(settings.transport.numerator.get());
-        const int denumState = uiDenominator.load(std::memory_order_relaxed) >= 0 ? uiDenominator.load(std::memory_order_relaxed) : static_cast<int>(settings.transport.denumerator.get());
-        const float bpmState = uiBpm.load(std::memory_order_relaxed) >= 0.0f ? uiBpm.load(std::memory_order_relaxed) : static_cast<float>(settings.transport.bpm.get());
-
-        playheadPosition_.setIsPlaying (isPlayingState);
         playheadPosition_.setTimeSignature(AudioPlayHead::TimeSignature ({numState, denumState}));
-        playheadPosition_.setBpm (bpmState);
+        
+        // Baseline: Tillämpa settings om inte nätverket eller UI har övertaget
+        if (! requests.isPlaying.has_value()) playheadPosition_.setIsPlaying(settings.transport.isPlaying.get());
+        else playheadPosition_.setIsPlaying(*requests.isPlaying);
+        
+        if (! requests.bpm.has_value()) playheadPosition_.setBpm(settings.transport.bpm.get());
+        else playheadPosition_.setBpm(*requests.bpm);
+        
         if (! playheadPosition_.getIsPlaying())
         {
             playheadPosition_.setPpqPosition({});
@@ -414,18 +511,47 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
             tickState.clear();
         }
 
-#if JUCE_IOS
         if (m_link.isLinkConnected())
         {
             m_link.linkPosition (playheadPosition_, requests);
-            uiIsPlaying.store(playheadPosition_.getIsPlaying() ? 1 : 0, std::memory_order_relaxed);
-            triggerAsyncUpdate();
         }
-#endif
     }
     else if (getPlayHead())
     {
         playheadPosition_ = getPlayHead()->getPosition().orFallback(AudioPlayHead::PositionInfo());
+        
+        // --- NY FUNKTION: DAW-to-Link Bridge ---
+        // Om TICK är inställd på att följa Cubase, tvinga ut Cubase-tempot och Play/Stop 
+        // till TouchDesigner via nätverket så lasern hänger med i DAW:ens tempo-automation!
+        if (m_link.isLinkConnected())
+        {
+            AbletonLink::Requests hostRequests;
+            // Säkerhet: Vissa DAW:s skickar 0.0 BPM vid laddning/hopp. Om vi trycker in 0.0 
+            // i Ableton Link kraschar nätverkets underliggande fas-matematik (division med noll).
+            const double hostBpm = juce::jmax(20.0, playheadPosition_.getBpm().orFallback(120.0));
+            const bool hostIsPlaying = playheadPosition_.getIsPlaying();
+            
+            // Endast pusha om DAW-tempot ändras för att inte spamma nätverket
+            if (std::abs(hostBpm - lastSettingsBpm) > 0.01 || hostIsPlaying != lastSettingsIsPlaying)
+            {
+                hostRequests.bpm = hostBpm;
+                hostRequests.isPlaying = hostIsPlaying;
+                
+                // Använd en dummy-pos så Link inte manipulerar tillbaka vår Cubase-tidslinje!
+                juce::AudioPlayHead::PositionInfo dummyPos = playheadPosition_;
+                m_link.linkPosition (dummyPos, hostRequests);
+                
+                lastSettingsBpm = (float)hostBpm;
+                lastSettingsIsPlaying = hostIsPlaying;
+            }
+        }
+    }
+    else
+    {
+        // DSP-Säkerhet: Vissa DAW:s (och AUv3 hosts) slutar skicka PlayHead-objekt helt 
+        // när transporten stoppas. Om vi inte fångar detta, fortsätter metronomen att 
+        // snurra i all evighet eftersom den sista kända statusen var "Spelar"!
+        playheadPosition_.setIsPlaying(false);
     }
 
     // DSP-Optimering & GUI-Fix: Uppdatera bara ValueTree om värdet har ändrats markant.
@@ -437,7 +563,20 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         const float newBpm = (float) *playheadPosition_.getBpm();
         if (std::abs(settings.transport.bpm.get() - newBpm) > 0.01f)
         {
-            uiBpm.store(newBpm, std::memory_order_relaxed);
+            // Läs av UI:t igen så vi inte skriver över en pågående tap/rattning
+            if (uiBpm.load(std::memory_order_relaxed) < 0.0f)
+            {
+                uiBpm.store(newBpm, std::memory_order_relaxed);
+                triggerAsyncUpdate();
+            }
+        }
+    }
+    // Håll koll om Ableton Link startar/stoppar nätverket utifrån (TouchDesigner)
+    if (playheadPosition_.getIsPlaying() != settings.transport.isPlaying.get())
+    {
+        if (uiIsPlaying.load(std::memory_order_relaxed) < 0)
+        {
+            uiIsPlaying.store(playheadPosition_.getIsPlaying() ? 1 : 0, std::memory_order_relaxed);
             triggerAsyncUpdate();
         }
     }
@@ -461,9 +600,10 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     
     // DSP-Optimering: Uppdatera filterkoefficienter oavsett om metronomen spelar
     // (annars uppdateras inte filtret när du skruvar på det medan DAW:en står stilla!)
-    // Säkerhet: Begränsa cutoff till Nyquist-frekvensen (Halva Sample Rate) för att förhindra krasch
-    const double actualSr = juce::jmax(1.0, getSampleRate());
-    const float safeCutoff = (float) juce::jmin((double)currentFilterCutoff, (actualSr / 2.0) - 1.0);
+    // Säkerhet: Begränsa cutoff BÅDE i botten (20Hz) och toppen (Nyquist) för att förhindra
+    // att filtret exploderar (NaN/krasch) ifall DAW-automationen drar värdet under 0!
+    const double actualSr = juce::jmax(44.0, getSampleRate()); // Garantera minst 44Hz så Nyquist alltid är > 20Hz!
+    const float safeCutoff = (float) juce::jlimit(20.0, (actualSr / 2.0) - 1.0, (double)currentFilterCutoff);
     
     if (lastCutoffHz != safeCutoff)
     {
@@ -473,12 +613,14 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
 
     if (isPlaying && !wasPlaying)
     {
-        midiMessages.addEvent(juce::MidiMessage::midiStart(), 0);
+        const juce::uint8 midiStartData[1] = { 0xFA };
+        midiMessages.addEvent(midiStartData, 1, 0);
         nextClockPpq = playheadPosition_.getPpqPosition().orFallback(0.0);
     }
     else if (!isPlaying && wasPlaying)
     {
-        midiMessages.addEvent(juce::MidiMessage::midiStop(), 0);
+        const juce::uint8 midiStopData[1] = { 0xFC };
+        midiMessages.addEvent(midiStopData, 1, 0);
     }
     wasPlaying = isPlaying;
 
@@ -500,9 +642,9 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         // Säkerhetsspärr: Förhindra division med noll (vilket fryser DAW:en) om BPM saknas
         if (bpm <= 0.0) bpm = 120.0;
         
-        double qps = bpm / 60.0; // quarters per second
         double sr = juce::jmax(1.0, getSampleRate()); // Säkerhetsspärr mot sr=0
-        double samplesPerQuarter = sr / qps;
+        // DSP-Optimering: (sr * 60.0) / bpm sparar processorn från en extra flyttalsdivision!
+        double samplesPerQuarter = (sr * 60.0) / bpm;
         
         // Beräkna var i denna buffer (PPQ) vi befinner oss
         double bufEndPpq = currentPpq + (buffer.getNumSamples() / samplesPerQuarter);
@@ -517,13 +659,19 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
             int maxSampleIndex = juce::jmax(0, buffer.getNumSamples() - 1);
             sampleOffset = juce::jlimit(0, maxSampleIndex, sampleOffset);
             
-            midiMessages.addEvent(juce::MidiMessage::midiClock(), sampleOffset);
+            const juce::uint8 midiClockData[1] = { 0xF8 };
+            midiMessages.addEvent(midiClockData, 1, sampleOffset);
             nextClockPpq += (1.0 / 24.0);
         }
     }
 
     if (playheadPosition_.getIsPlaying())
     {
+        // DSP-Optimering: Spela ALLTID ut ljudsvansen från det föregående klicket FÖRST,
+        // och helt utanför try_lock(). Detta garanterar att ett pågående metronoms-klick 
+        // ALDRIG hackar (digitalt pop-ljud), även om GUI-tråden tillfälligt blockerar TicksHolder!
+        tickState.fillTickSample (buffer);
+
         if (ticks.getLock().try_lock())
         {
         const auto ppqPosition = playheadPosition_.getPpqPosition().orFallback(0);
@@ -539,7 +687,7 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         const auto pos = juce::jmax(0.0, ppqPosition - lastBarStart);
         const auto bps = bpm / 60.0;
         const double sr = juce::jmax(1.0, getSampleRate()); // Säkerhetsspärr mot sr=0
-        const auto bpSmp = sr / bps;
+        const auto bpSmp = (sr * 60.0) / bpm; // DSP-Optimering: Matematiskt förenklat för att slippa division
         const auto ttq = (4.0 / juce::jmax(1, ts.denominator)); // tick to quarter (säkerhetsspärr)
         // Säkerhetsspärr: Förhindra division med noll ifall tickMultiplier blir 0.0
         const auto tickAt = ttq / juce::jmax(0.001f, currentTickMultiplier); 
@@ -573,10 +721,6 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         }
         else
         {
-            // FIX: Spela upp eventuellt pågående klick (svansen från förra blocket) INNAN vi letar efter nya klick.
-            // Detta förhindrar "tidsresor" där framtida ljud läckte bakåt i bufferten vid snabba BPM!
-            tickState.fillTickSample (buffer);
-
             while (ppqToBufEnd > ppqPosInBuf)
             {
                 jassert (ppqToBufEnd >= ppqPosInBuf);
@@ -608,7 +752,9 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                     juce::AudioBuffer<float> tickAlias (tickState.sample.getArrayOfWritePointers(), 1, playLen);
                     tickAlias.copyFrom(0, 0, tickState.refer[0], playLen);
 
-                    if (tickState.currentSample >= 0)
+                    // DSP-Fix: Applicera fade-out ENDAST om ljudfilen kapas i förtid av ett högt BPM!
+                    // Detta smoothar ut snittet och förhindrar digitala klickljud i slutet av varje slag.
+                    if (playLen < tickLen)
                         TickUtils::fadeOut (tickAlias);
                     // hard-clip if needed
                     TickUtils::processClip (tickAlias);
@@ -622,11 +768,22 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                     // Användarspecifika noter via inställningarna (Kanal 10 - Trummor)
                     const int midiNote = (tickState.beat == 1) ? currentNote1 : currentNoteOther;
                     const juce::uint8 velocity = (juce::uint8)juce::jlimit(1, 127, (int)(tickState.beatGain * 127.0f));
-                    midiMessages.addEvent(juce::MidiMessage::noteOn(10, midiNote, velocity), currentSampleToTick);
                     
-                    // FIX: Förhindra krasch (KERNELBASE.dll) om Cubase skickar "Flush"-buffertar med 0 samples (då blir index -1!)
-                    const int noteOffSample = juce::jlimit(0, juce::jmax(0, buffer.getNumSamples() - 1), currentSampleToTick + 500);
-                    midiMessages.addEvent(juce::MidiMessage::noteOff(10, midiNote, (juce::uint8)0), noteOffSample);
+                    const int numSamples = buffer.getNumSamples();
+                    if (numSamples > 0)
+                    {
+                        // FIX: Förhindra "Zero-Length Notes". Om klicket sker exakt på sista samplet i 
+                        // bufferten hamnade Note On och Note Off på exakt samma tid, vilket fick TouchDesigner att 
+                        // helt missa pulsen! Vi garanterar nu alltid minst 1 sample differens.
+                        const int safeNoteOn = (currentSampleToTick >= numSamples - 1 && numSamples > 1) ? numSamples - 2 : juce::jmin(currentSampleToTick, numSamples - 1);
+                        const int safeNoteOff = juce::jmin(safeNoteOn + 500, numSamples - 1);
+
+                        const juce::uint8 noteOnData[3] = { 0x99, (juce::uint8)midiNote, velocity };
+                        midiMessages.addEvent(noteOnData, 3, safeNoteOn);
+                        
+                        const juce::uint8 noteOffData[3] = { 0x89, (juce::uint8)midiNote, 0 };
+                        midiMessages.addEvent(noteOffData, 3, safeNoteOff);
+                    }
                 }
             }
         }
@@ -651,19 +808,28 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
 
     // DSP-Optimering: Anropa inte 'std::pow' (decibelsToGain) för varje ljudblock!
     // Cacha multiplikatorn och uppdatera bara när volymen faktiskt ändras av användaren.
+    float newMasterGainMultiplier = masterGainMultiplier;
     if (lastMasterGainDb != currentMasterGain)
     {
-        masterGainMultiplier = juce::Decibels::decibelsToGain (currentMasterGain);
+        newMasterGainMultiplier = juce::Decibels::decibelsToGain (currentMasterGain);
         lastMasterGainDb = currentMasterGain;
     }
-    buffer.applyGain (masterGainMultiplier);
+
+    // DSP-Säkerhet: Använd 'applyGainRamp' om volymen ändras, för att förhindra digitala 
+    // klickljud ("zipper noise") mellan blocken när användaren skruvar på reglaget!
+    if (newMasterGainMultiplier == masterGainMultiplier)
+        buffer.applyGain (masterGainMultiplier);
+    else
+        buffer.applyGainRamp (0, buffer.getNumSamples(), masterGainMultiplier, newMasterGainMultiplier);
+        
+    masterGainMultiplier = newMasterGainMultiplier;
 
     // LIVE SHOW OPTIMERING: Avancera standalone-tidslinjen HÄR i slutet av blocket!
-    // Om vi gör det i början av processBlock hamnar MIDI-klockan och audioklicket 1 ljudblock i "framtiden",
-    // vilket orsakar jitter och osynk. Nu räknas blocket ut exakt där vi är, sen flyttar vi fram markören.
+    // BARA om Ableton Link INTE är anslutet. Är Link anslutet sköter nätverket all tid!
+    // Annars dubbel-avancerar vi och skapar massivt jitter mot TouchDesigner.
     if (! isHostSyncSupported() || ! getState().useHostTransport.get())
     {
-        if (playheadPosition_.getIsPlaying())
+        if (playheadPosition_.getIsPlaying() && ! m_link.isLinkConnected())
         {
             const double safeSr = juce::jmax(1.0, getSampleRate()); // Säkerhetsspärr mot div-med-noll
             const double bufInSecs = buffer.getNumSamples() / safeSr;
@@ -676,11 +842,20 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     
     // Trådsäker överföring av UI-data (Undviker Undefined Behavior / Data Race i gränssnittet)
     const auto ppqForUI = playheadPosition_.getPpqPosition().orFallback(0);
+    const auto lastBarStartForUI = playheadPosition_.getPpqPositionOfLastBarStart().orFallback(0);
     const auto tsForUI = playheadPosition_.getTimeSignature().orFallback(AudioPlayHead::TimeSignature ({1, 4}));
     const auto ttqForUI = (4.0 / juce::jmax(1, tsForUI.denominator)); 
-    auto subDivForUI = fmod (ppqForUI, ttqForUI) / ttqForUI;
-    uiCurrentBeatPos.store(tickState.beat + subDivForUI, std::memory_order_relaxed);
-    uiCurrentBeat.store(tickState.beat, std::memory_order_relaxed);
+    const double posForUI = juce::jmax(0.0, ppqForUI - lastBarStartForUI);
+    
+    // GUI-Optimering: Frikoppla det visuella gränssnittet HELT från ljudtrådens lås (TicksHolder)!
+    // Nu kommer metronomen animeras helt mjukt på skärmen även om ljudtråden tillfälligt 
+    // missar ett lås för att datorn är tungt belastad av t.ex. sample-laddning i bakgrunden.
+    const int safeNumeratorUI = juce::jmax(1, tsForUI.numerator);
+    const int currentBeatForUI = juce::roundToInt (floor (fmod ((posForUI + 0.0001) / ttqForUI, safeNumeratorUI))) + 1;
+
+    auto subDivForUI = fmod (posForUI, ttqForUI) / ttqForUI;
+    uiCurrentBeatPos.store(currentBeatForUI + subDivForUI, std::memory_order_relaxed);
+    uiCurrentBeat.store(currentBeatForUI, std::memory_order_relaxed);
 }
 
 //==============================================================================

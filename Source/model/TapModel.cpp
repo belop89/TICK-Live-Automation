@@ -13,7 +13,8 @@ double TapModel::pushTap (uint32_t nowMs)
         
         // Säkerhets-debounce: ignorera om det gått för kort tid
         if (deltaMs < minTapIntervalMs)
-            return lastDetectedBPM.load(std::memory_order_relaxed);
+            // ACQUIRE: Garantera minnessynkronisering på Apple Silicon även vid early-return!
+            return lastDetectedBPM.load(std::memory_order_acquire);
             
         // Återställ listan om det gått för lång tid (över 3 sekunder) - ny låt/nytt tempo!
         if (deltaMs > maxTapIntervalMs)
@@ -33,14 +34,17 @@ double TapModel::pushTap (uint32_t nowMs)
     if (currentNum < maxPointsToKeep)
         currentNum++;
 
-    numTapPoints.store(currentNum, std::memory_order_relaxed);
+    // RELEASE: Garantera att tidsstämplarna har publicerats i RAM-minnet (viktigt för ARM/Apple Silicon)
+    // innan GUI-tråden får reda på att antalet klick (currentNum) har ökat!
+    numTapPoints.store(currentNum, std::memory_order_release);
 
     // Tre-klicks-regeln: Kräver minst 3 klick för att sätta tempo (skydd mot Helix spök-klick)
     if (currentNum < 3)
-        return lastDetectedBPM.load(std::memory_order_relaxed);
+        return lastDetectedBPM.load(std::memory_order_acquire);
         
-    // Matte-optimering: Beräkna snitt direkt mellan första och sista punkten
-    const double avgDelta = (double)(tapPoints[0].load(std::memory_order_relaxed) - tapPoints[currentNum - 1].load(std::memory_order_relaxed)) / (currentNum - 1);
+    // DSP-Optimering: Undvik ett onödigt atomiskt load-anrop genom att återanvända 'nowMs'
+    // eftersom vi precis sparade det på index 0! Detta sparar en cache-coherency ping på processorn.
+    const double avgDelta = (double)(nowMs - tapPoints[currentNum - 1].load(std::memory_order_relaxed)) / (currentNum - 1);
     const double newBPM = msToBPM (avgDelta);
 
     // Helix-skyddet: Om tempot plötsligt diffar med mer än 50 BPM från vårt nuvarande tempo,
@@ -50,17 +54,18 @@ double TapModel::pushTap (uint32_t nowMs)
     if (currentBpm > 0.0 && std::abs (newBPM - currentBpm) > bpmDriftTolerance)
     {
         tapPoints[0].store(nowMs, std::memory_order_relaxed);
-        numTapPoints.store(1, std::memory_order_relaxed);
+        numTapPoints.store(1, std::memory_order_release);
         return currentBpm;
     }
 
-    lastDetectedBPM.store(newBPM, std::memory_order_relaxed);
+    lastDetectedBPM.store(newBPM, std::memory_order_release);
     return newBPM;
 }
 
 int TapModel::getXforCurrentRange (uint32_t nowMs, int areaWidth) const
 {
-    int currentNum = numTapPoints.load(std::memory_order_relaxed);
+    // ACQUIRE: Hämta antalet klick med en memory barrier så vi inte läser o-synkat skräpminne från tapPoints
+    int currentNum = numTapPoints.load(std::memory_order_acquire);
 
     if (currentNum == 0)
         return 0;
@@ -80,19 +85,19 @@ int TapModel::getXforCurrentRange (uint32_t nowMs, int areaWidth) const
 
 void TapModel::clear()
 {
-    numTapPoints.store(0, std::memory_order_relaxed);
-    lastDetectedBPM.store(0.0, std::memory_order_relaxed);
+    numTapPoints.store(0, std::memory_order_release);
+    lastDetectedBPM.store(0.0, std::memory_order_release);
 }
 
 double TapModel::getLastDetectedBPM() const
 {
-    // Trådsäker och blixtsnabb "lock-free" avläsning tack vare atomics
-    return lastDetectedBPM.load(std::memory_order_relaxed);
+    // ACQUIRE: Trådsäker och blixtsnabb "lock-free" avläsning med korrekt synk för Apple Silicon
+    return lastDetectedBPM.load(std::memory_order_acquire);
 }
 
 double TapModel::msToBPM (double ms)
 {
     if (ms <= 0.0) return 0.0;
-    auto secs = ms / 1000.0;
-    return 60.0 / secs;
+    // DSP-Optimering: 60 / (ms / 1000) = 60000 / ms. Vi sparar en hel flyttalsdivision!
+    return 60000.0 / ms;
 }

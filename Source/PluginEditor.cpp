@@ -31,7 +31,8 @@ TickAudioProcessorEditor::TickAudioProcessorEditor (TickAudioProcessor& p)
     auto& state = tickProcessor.getState();
     background.setBufferedToImage (true);
     addAndMakeVisible (background);
-    juce::LookAndFeel::setDefaultLookAndFeel (&lookAndFeel);
+    // SÄKERHET: Sätt LookAndFeel LOKALT för just denna instans så att flera TICK-plugins inte kraschar varandra!
+    setLookAndFeel (&lookAndFeel); 
 
     lookAndFeel.setColour (juce::Label::outlineWhenEditingColourId, juce::Colours::transparentBlack);
     lookAndFeel.setColour (juce::PopupMenu::highlightedTextColourId, juce::Colours::white);
@@ -112,10 +113,8 @@ TickAudioProcessorEditor::TickAudioProcessorEditor (TickAudioProcessor& p)
         settings.addItem ("External (Host)", canExternal, transport.get(), [&transport] {
             transport.setValue (true, nullptr);
         });
-#if JUCE_IOS
-        settings.addItem ("Ableton Link..", true, tickProcessor.m_link.isLinkConnected(), [this]
-                          { tickProcessor.m_link.showSettings (settingsButton, nullptr); });
-#endif
+        settings.addItem ("Ableton Link", true, tickProcessor.m_link.isEnabled(), [this]
+                          { tickProcessor.m_link.setEnabled (! tickProcessor.m_link.isEnabled()); });
         settings.addSeparator();
         PopupMenu preCountMenu;
         auto& preCount = tickProcessor.getState().transport.preCount;
@@ -271,9 +270,13 @@ TickAudioProcessorEditor::TickAudioProcessorEditor (TickAudioProcessor& p)
     setResizable (true, true);
     //    375 x 667 iPhone 6
 #if JUCE_WINDOWS || JUCE_MAC || JUCE_LINUX
-    const auto size = VariantConverter<ViewDiemensions>::fromVar (state.view.windowSize.getValue());
-    setSize (size.x, size.y);
+    // GUI-Säkerhet: Definiera absolut MINSTA fönsterstorlek FÖRST.
     setResizeLimits (280, 260, 2048, 4096);
+
+    const auto size = VariantConverter<ViewDiemensions>::fromVar (state.view.windowSize.getValue());
+    // FIX: Tvinga start-storleken att respektera gränserna. Om XML-filen är tom eller korrupt (size 0x0)
+    // förhindrar detta att plugin-fönstret öppnas som en osynlig 0-pixel prick i DAW:en!
+    setSize (juce::jlimit(280, 2048, size.x), juce::jlimit(260, 4096, size.y));
 #else
     Desktop::getInstance().setScreenSaverEnabled (false);
     setSize (375, 667);
@@ -288,7 +291,15 @@ TickAudioProcessorEditor::~TickAudioProcessorEditor()
     tickProcessor.getState().view.isEdit.removeListener (this);
     tickProcessor.getState().view.showEditSamples.removeListener (this);
     tickProcessor.getState().view.showPresetsView.removeListener (this);
-    juce::LookAndFeel::setDefaultLookAndFeel (nullptr);
+    
+    // SÄKERHET: Detach OpenGL-kontexten FÖRST av allt, för att stoppa renderings-tråden
+    // innan vi börjar riva ner (och nollställa LookAndFeel på) komponenterna i gränssnittet. 
+    // Förhindrar sällsynta EXC_BAD_ACCESS grafik-krascher när VST-fönstret stängs!
+#if ! JUCE_IOS
+    openglContext.detach();
+#endif
+
+    setLookAndFeel (nullptr); 
 }
 
 //==============================================================================
@@ -330,7 +341,8 @@ void TickAudioProcessorEditor::resized()
     topBar.removeChildComponent (&bottomBar);
     removeChildComponent (&bottomBar);
 
-#if ! JUCE_IOS || ! JUCE_ANDROID
+    // OS-Fix: Använd '&&' istället för '||' för att regeln ska fungera logiskt.
+#if ! JUCE_IOS && ! JUCE_ANDROID
     tickProcessor.getState().view.windowSize.setValue (String (getWidth()) + "," + String (getHeight()));
 #endif
     auto safeArea = Desktop::getInstance().getDisplays().getPrimaryDisplay()->safeAreaInsets;
@@ -471,22 +483,33 @@ void TickAudioProcessorEditor::timerCallback()
         
     if (showPreCount)
     {
-        const char* preStrs[] = { "0BAR", "1BAR", "2BAR", "3BAR", "4BAR" };
-        // Säkerhet: Förhindra krasch genom att hämta negativa index om DAW:en tvingar preCount till < 0
-        const juce::String preStr = (preCount >= 0 && preCount <= 4) ? juce::String(preStrs[preCount]) : (juce::String (preCount) + "BAR");
-        if (bottomBar.preCountIndicator.getButtonText() != preStr)
-            bottomBar.preCountIndicator.setButtonText (preStr);
+            // GUI-Optimering: Skapa inte nya strängar och anropa text-uppdateringar 50 gånger i sekunden
+            // om värdet inte faktiskt har ändrats.
+            const int lastPreCount = bottomBar.preCountIndicator.getProperties().getWithDefault("lastPre", -1);
+            if (preCount != lastPreCount)
+            {
+                const char* preStrs[] = { "0BAR", "1BAR", "2BAR", "3BAR", "4BAR" };
+                const juce::String preStr = (preCount >= 0 && preCount <= 4) ? juce::String(preStrs[preCount]) : (juce::String (preCount) + "BAR");
+                bottomBar.preCountIndicator.setButtonText (preStr);
+                bottomBar.preCountIndicator.getProperties().set("lastPre", preCount);
+            }
     }
-#if JUCE_IOS
     const auto link = tickProcessor.m_link.isLinkConnected();
     bottomBar.transportButton.setColour (juce::DrawableButton::backgroundColourId, link ? TickLookAndFeel::Colours::mint : Colours::transparentBlack);
     bottomBar.transportButton.setColour (juce::DrawableButton::backgroundOnColourId, link ? TickLookAndFeel::Colours::mint : Colours::transparentBlack);
-#endif
     bottomBar.transportPosition.setVisible (useHostTransport);
     performView->setTapVisibility (! useHostTransport);
     if (useHostTransport)
     {
-        bottomBar.transportPosition.setText (TickUtils::generateTimecodeDisplay (tickProcessor.playheadPosition_), dontSendNotification);
+        // GUI-Optimering: Förhindra att Timecode-strängen allokeras (vilket skapar heap-skräp) 
+        // 50 gånger i sekunden när DAW:en står stilla!
+        const double currentSecs = tickProcessor.playheadPosition_.getTimeInSeconds().orFallback(0.0);
+        const double lastSecs = bottomBar.transportPosition.getProperties().getWithDefault("lastSecs", -1.0);
+        if (std::abs(currentSecs - lastSecs) > 0.001)
+        {
+            bottomBar.transportPosition.setText (TickUtils::generateTimecodeDisplay (tickProcessor.playheadPosition_), dontSendNotification);
+            bottomBar.transportPosition.getProperties().set("lastSecs", currentSecs);
+        }
     }
 }
 

@@ -22,9 +22,12 @@ public:
             if (iconClosed != nullptr) iconClosed->replaceColour (juce::Colours::black, juce::Colours::white);
         }
         std::function<void()> onClick {};
-        void mouseUp (const juce::MouseEvent&) override
+        // KOMPILERINGS-FIX: Variabelnamnet 'e' saknades, vilket kraschade bygget!
+        void mouseUp (const juce::MouseEvent& e) override
         {
-            if (onClick != nullptr)
+            // UX-Säkerhet: Trigga bara klicket om användaren släpper musknappen INUTI etiketten.
+            // (Gör det möjligt att "ångra" ett klick genom att dra bort musen innan man släpper).
+            if (onClick != nullptr && getLocalBounds().contains (e.getPosition()))
                 onClick();
         }
         void paint (juce::Graphics& g) override

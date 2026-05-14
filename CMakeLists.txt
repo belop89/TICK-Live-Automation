@@ -79,6 +79,8 @@ endif()
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     set(ICON "tick_icon.png")
+    # UI/Terminal-Fix: Stäng av tjatiga MSVC-varningar (int->float) för en helt klinisk terminal!
+    add_compile_options(/wd4244 /wd4312 /wd4189)
 endif()
 
 if(UNIX AND NOT APPLE)
@@ -99,6 +101,40 @@ set_property(GLOBAL PROPERTY USE_FOLDERS YES)
 
 add_subdirectory(${CMAKE_SOURCE_DIR}/libsamplerate)
 add_subdirectory(${CMAKE_SOURCE_DIR}/JUCE)
+
+# FIX: Tillåt äldre CMake-skript i tredjepartsbibliotek (Ableton Link)
+# Detta förhindrar att VS Codes inbyggda CMake Tools kraschar vid auto-konfigurering.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
+# Tysta även varningar om föråldrad CMake-kod (Deprecation Warnings) i Abletons skript
+set(CMAKE_WARN_DEPRECATED OFF)
+
+# Ladda ner och länka den officiella plattformsoberoende Ableton Link C++-motorn
+include(FetchContent)
+FetchContent_Declare(
+    ableton_link
+    GIT_REPOSITORY https://github.com/Ableton/link.git
+    # CI/CD SÄKERHET: Lås till en specifik, stabil release! Annars kraschar ditt projekt 
+    # slumpmässigt den dagen Ableton gör en "breaking change" på sin master-branch!
+    GIT_TAG        Link-3.0.6
+)
+
+# Stäng av Abletons egna tester och exempelprogram för att spara tid och undvika onödiga fel
+set(LINK_BUILD_QT_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(LINK_BUILD_AUDIO_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(LINK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+# FIX: Lura Ableton Link att ASIO är "ON" för att tysta deras interna WASAPI-varning i VS Code. 
+# Eftersom vi har stängt av byggandet av exempelprogrammen ovan, kommer koden ändå aldrig att kompilera!
+set(LINK_BUILD_ASIO ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(ableton_link)
+
+# CI/CD & Bygg-optimering: Ableton Link bygger automatiskt massa exempelprogram (LinkHut) 
+# och tester i bakgrunden. Dessa innehåller föråldrad C++ kod som kraschar moderna 
+# kompilatorer (C++20). Vi plockar bort dem från bygget helt och hållet!
+foreach(_link_target LinkHut LinkHutSilent LinkDiscoveryTest LinkCoreTest link_hut abl_link)
+    if(TARGET ${_link_target})
+        set_target_properties(${_link_target} PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    endif()
+endforeach()
 
 set(PLUGIN_FORMATS_TO_BUILD VST3)
 
@@ -181,6 +217,7 @@ target_sources(TICK
     Source/components/TransportBar.h
     Source/components/TransportBar.cpp
     Source/model/AbletonLink.h
+    Source/model/AbletonLink.cpp
     Source/model/JuceState.h
     Source/model/TapModel.h
     Source/model/TapModel.cpp
@@ -197,7 +234,6 @@ target_sources(TICK
 if(APPLE_IOS)
     target_sources(TICK
         PRIVATE
-        Source/model/AbletonLink.mm
         Source/utils/UtilityFunctions.mm
     )
 
@@ -224,7 +260,22 @@ target_compile_definitions(TICK
     JUCE_COREGRAPHICS_RENDER_WITH_MULTIPLE_PAINT_CALLS=1
     JUCE_USE_CUSTOM_PLUGIN_STANDALONE_APP=1
     JUCE_CONTENT_SHARING=1
+    # Nätverk: ASIO krävs för Ableton Links asynkrona trådar
+    ASIO_STANDALONE=1
 )
+
+# OS-Specifika flaggor för att Ableton Link ska hitta rätt nätverksbibliotek
+if(WIN32)
+    target_compile_definitions(TICK PUBLIC
+        LINK_PLATFORM_WINDOWS=1
+        _WIN32_WINNT=0x0A00 # Tvinga fram Windows 10 SDK för att få tillgång till htonll
+        WIN32_LEAN_AND_MEAN=1 # Förhindra att windows.h blockerar winsock2.h!
+    )
+elseif(APPLE)
+    target_compile_definitions(TICK PUBLIC LINK_PLATFORM_MACOSX=1)
+elseif(UNIX AND NOT APPLE)
+    target_compile_definitions(TICK PUBLIC LINK_PLATFORM_LINUX=1)
+endif()
 
 juce_add_binary_data(TickBinaryData
     SOURCES
@@ -264,15 +315,6 @@ add_custom_target(
 
 add_dependencies(TICK generate_git_revision)
 
-if(APPLE_IOS)
-    if(EXISTS "private/LinkKit")
-        message("Ableton LinkKit (iOS)")
-        set(CMAKE_XCODE_ATTRIBUTE_OTHER_LDFLAGS[sdk=iphoneos*] "${CMAKE_SOURCE_DIR}/private/LinkKit/LinkKit.xcframework/ios-arm64_armv7/libLinkKit.a")
-        set(CMAKE_XCODE_ATTRIBUTE_OTHER_LDFLAGS[sdk=iphonesimulator*] "${CMAKE_SOURCE_DIR}/private/LinkKit/LinkKit.xcframework/ios-arm64_i386_x86_64-simulator/libLinkKit.a")
-        set(IOS_INCLUDES "${CMAKE_SOURCE_DIR}/private/LinkKit/LinkKit.xcframework/ios-arm64_armv7/Headers")
-    endif()
-endif()
-
 juce_generate_juce_header(TICK)
 
 target_link_libraries(TICK
@@ -287,12 +329,20 @@ target_link_libraries(TICK
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags)
 
+# Nätverk: Ableton Link är "Header-Only". Eftersom dess inbyggda CMake-Alias 
+# göms av FetchContent, länkar vi manuellt Windows nätverksbibliotek istället!
+if(WIN32)
+    target_link_libraries(TICK PRIVATE ws2_32 mswsock)
+endif()
+
 target_include_directories(TICK
     PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/Source
     ${CMAKE_SOURCE_DIR}/JUX
     ${CMAKE_SOURCE_DIR}/libsamplerate/include
+    ${ableton_link_SOURCE_DIR}/include
+    ${ableton_link_SOURCE_DIR}/modules/asio-standalone/asio/include
     ${IOS_INCLUDES}
 )
 

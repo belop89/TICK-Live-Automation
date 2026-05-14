@@ -112,11 +112,15 @@ void PerformView::resized()
 
     const auto isVertical = state.isVertical.get();
     beatsInRow = juce::jlimit (1, 8, juce::jmin (state.transport.numerator.get(), state.transport.denumerator.get()));
-    const int beatSize = static_cast<int> (std::floor (((isVertical ? area.getHeight() : area.getWidth()) - 2 * kMargin)) / beatsInRow) - 2 * kMargin;
-    const auto beatHeight = (int) std::min (beatSize, area.getHeight() - 3 * kMargin);
-    const auto itemWidth = isVertical ? area.getWidth() - 2 * kMargin - viewport.getScrollBarThickness() : beatSize;
+    // GUI-Säkerhet: Förhindra negativa dimensioner vid extremt snabb fönster-omskalning (kraschar FlexBox!)
+    const int beatSize = std::max(1, static_cast<int> (std::floor (((isVertical ? area.getHeight() : area.getWidth()) - 2 * kMargin)) / beatsInRow) - 2 * kMargin);
+    const auto beatHeight = std::max(1, (int) std::min (beatSize, area.getHeight() - 3 * kMargin));
+    const auto itemWidth = std::max(1, isVertical ? area.getWidth() - 2 * kMargin - viewport.getScrollBarThickness() : beatSize);
     const auto numOfBeats = state.transport.numerator.get();
-    beatsView.setBounds (area.withHeight (std::max (area.getHeight(), (isVertical ? state.transport.numerator.get() : (int) std::ceil (numOfBeats / beatsInRow)) * (beatSize + 2 * kMargin) + kMargin)).withWidth (area.getWidth() - viewport.getScrollBarThickness()));
+    // GUI-Optimering/Fix: Cast 'numOfBeats' till float innan division! Annars gör C++ integer-division (ex. 5/4 = 1)
+    // vilket leder till att de sista slagen klipps bort och blir osynliga i oregelbundna taktarter.
+    const int safeWidth = std::max(1, area.getWidth() - viewport.getScrollBarThickness());
+    beatsView.setBounds (area.withHeight (std::max (area.getHeight(), (isVertical ? state.transport.numerator.get() : (int) std::ceil ((float)numOfBeats / beatsInRow)) * (beatSize + 2 * kMargin) + kMargin)).withWidth (safeWidth));
     juce::FlexBox fb (isVertical ? juce::FlexBox::Direction::column : juce::FlexBox::Direction::row, juce::FlexBox::Wrap::wrap, juce::FlexBox::AlignContent::flexStart, juce::FlexBox::AlignItems::center, juce::FlexBox::JustifyContent::flexStart);
     
     const float fBeatHeight = static_cast<float> (beatHeight);
@@ -140,16 +144,25 @@ void PerformView::update (double currentPos)
 {
     // Säkerhetsspärr: Förhindra Memory Access Violation om DAW:en skickar extrema taktartsvärden (>64)
     const auto numOfBeats = juce::jlimit(1, (int)TickSettings::kMaxBeatAssignments, state.transport.numerator.get());
-    const auto denumrator = state.transport.denumerator.get();
-    if ((size_t) numOfBeats != beats.size() || beatsInRow != denumrator)
+    
+    // GUI-Optimering/Fix: Jämför INTE beatsInRow direkt med denumrator! Vid udda taktarter (ex 3/8) 
+    // låstes de i ojämlikhet (3 != 8), vilket orsakade en evighetsloop där gränssnittet raderades 
+    // och heap-allokerades 50 gånger i sekunden!
+    const int expectedBeatsInRow = juce::jlimit (1, 8, juce::jmin (state.transport.numerator.get(), state.transport.denumerator.get()));
+    const bool layoutChanged = (beatsInRow != expectedBeatsInRow);
+    
+    if ((size_t) numOfBeats != beats.size() || layoutChanged)
     {
-        beats.clear();
-        for (auto beat = 0; beat < numOfBeats; beat++)
+        if ((size_t) numOfBeats != beats.size())
         {
-            auto beatView = std::make_unique<BeatView> (*this, beat);
-            beatView->setEnabled (isEditMode);
-            beats.push_back (std::move (beatView));
-            beatsView.addAndMakeVisible (beats.back().get());
+            beats.clear();
+            for (auto beat = 0; beat < numOfBeats; beat++)
+            {
+                auto beatView = std::make_unique<BeatView> (*this, beat);
+                beatView->setEnabled (isEditMode);
+                beats.push_back (std::move (beatView));
+                beatsView.addAndMakeVisible (beats.back().get());
+            }
         }
         resized();
     }
@@ -175,11 +188,16 @@ void PerformView::update (double currentPos)
     }
     const bool isStandalone = ! state.useHostTransport.get();
     
-    // GUI-Optimering: Jämför värden lokalt för att helt undvika att allokera strängar
-    // (som juce::String) 50 gånger i sekunden!
-    if (topBar.tempo.isEnabled() != isStandalone || std::abs(state.transport.bpm.get() - topBar.tempo.getText().getFloatValue()) > 0.01f)
+    // GUI-Optimering: Använd komponentens inbyggda property-minne för att slippa anropa 
+    // getText() som annars skapar heap-allokeringar (juce::String) 50 gånger i sekunden per instans!
+    const float currentBpm = state.transport.bpm.get();
+    const float lastBpm = topBar.tempo.getProperties().getWithDefault("lastBpm", -1.0f);
+    
+    if (topBar.tempo.isEnabled() != isStandalone || std::abs(currentBpm - lastBpm) > 0.01f)
     {
-        topBar.tempo.setDescription (juce::String (state.transport.bpm.get()) + "BPM");
+        topBar.tempo.getProperties().set("lastBpm", currentBpm);
+        
+        topBar.tempo.setDescription (juce::String (currentBpm) + "BPM");
         topBar.num.setDescription (juce::String (state.transport.numerator.get()) + " beats numerator");
         topBar.denum.setDescription (juce::String (state.transport.denumerator.get()) + " beats denumerator");
         topBar.tempo.setEnabled (isStandalone);
@@ -390,9 +408,9 @@ void PerformView::BeatView::mouseDown (const juce::MouseEvent& e)
         return;
     owner.selectionChanged (index);
     repaint();
-#if ! JUCE_IOS || ! JUCE_ANDROID
+    // UI-Fix: Ta bort OS-begränsningen helt! Detta är en Slider, om vi blockerar mouseDown 
+    // på mobila enheter går det inte att justera volymen för individuella slag på iPad/Android.
     juce::Slider::mouseDown (e);
-#endif
 }
 
 static void setupSigLabel (juce::Label& l)

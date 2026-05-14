@@ -45,7 +45,8 @@ SharedPresetIcons* SharedPresetIcons::instance = nullptr;
 
 static void createFolderCallback (int modalResult, PresetsView* view, juce::Component::SafePointer<DialogComponent> alert)
 {
-    if (modalResult == 1 && view != nullptr)
+    // Säkerhet: Kontrollera alltid att 'alert' inte är nullptr ifall fönstret stängdes asynkront!
+    if (modalResult == 1 && view != nullptr && alert != nullptr)
     {
         const auto input = alert->getTextEditorContents ("FolderInput").trim();
         if (input.isNotEmpty() && ! input.containsAnyOf ("/\\*:?\"<>|"))
@@ -68,7 +69,8 @@ static void createFolderCallback (int modalResult, PresetsView* view, juce::Comp
 
 static void savePresetCallback (int modalResult, PresetsView* view, juce::Component::SafePointer<DialogComponent> alert)
 {
-    if (modalResult == 1 && view != nullptr)
+    // Säkerhet: Kontrollera alltid att 'alert' inte är nullptr ifall fönstret stängdes asynkront!
+    if (modalResult == 1 && view != nullptr && alert != nullptr)
     {
         const auto input = alert->getTextEditorContents ("PresetNameInput").trim();
         if (input.isEmpty() || input.containsAnyOf ("/\\*:?\"<>|"))
@@ -93,20 +95,21 @@ static void savePresetCallback (int modalResult, PresetsView* view, juce::Compon
                 "Yes",
                 "No",
                 view->getTopLevelComponent(),
-                juce::ModalCallbackFunction::create ([view, newPreset, discardTransport] (int result) {
-                    if (result != 0)
+                juce::ModalCallbackFunction::create ([safeView = juce::Component::SafePointer<PresetsView>(view), newPreset, discardTransport] (int result) {
+                    // SÄKERHET: Kontrollera att safeView fortfarande lever ifall användaren hann stänga fönstret!
+                    if (result != 0 && safeView != nullptr)
                     {
                         // TODO:check it actually overwrite
                         if (newPreset.deleteFile())
                         {
-                            view->savePreset (newPreset, discardTransport);
+                            safeView->savePreset (newPreset, discardTransport);
                         }
                         else
                         {
                             jassertfalse;
                             juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::AlertIconType::WarningIcon, "Error", "Failed overwriting preset!");
                         }
-                        view->refresh();
+                        safeView->refresh();
                     }
                 }));
         }
@@ -120,9 +123,9 @@ static void savePresetCallback (int modalResult, PresetsView* view, juce::Compon
 
 static void deleteFileCallback (int modalResult, PresetsView* view, juce::Component::SafePointer<DialogComponent> alert)
 {
-    juce::File file (alert->getProperties().getWithDefault ("filename", {}));
-    if (modalResult == 1 && view != nullptr)
+    if (modalResult == 1 && view != nullptr && alert != nullptr)
     {
+        juce::File file (alert->getProperties().getWithDefault ("filename", {}));
         if (file.exists() && ! file.deleteRecursively())
         {
             juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::AlertIconType::WarningIcon, "Can\'t Delete!", "This might be due to permissions. Please retry!");
@@ -514,16 +517,22 @@ void PresetsView::PresetModel::paintListBoxItem (int, juce::Graphics&, int, int,
 
 void PresetsView::PresetModel::listBoxItemClicked (int row, const juce::MouseEvent&)
 {
-    auto* item = static_cast<PresetView*> (owner.list.getComponentForRowNumber (row));
-    if (item->data.isFolder)
+    // UI-Säkerhet: Undvik att hämta data från den grafiska komponenten (som kan vara nullptr 
+    // på grund av list-återvinning/recycling). Läs direkt från vår datamodell istället!
+    if (owner.directoryContents == nullptr || row < 0 || row >= owner.directoryContents->getNumFiles())
+        return;
+        
+    const auto file = owner.directoryContents->getFile (row);
+    
+    if (file.isDirectory())
     {
         owner.transitionList();
-        owner.directoryContents->setDirectory (owner.directoryContents->getFile (row), true, true);
+        owner.directoryContents->setDirectory (file, true, true);
         owner.list.deselectAllRows();
     }
     else
     {
-        owner.loadPreset (owner.directoryContents->getFile (row));
+        owner.loadPreset (file);
     }
 }
 

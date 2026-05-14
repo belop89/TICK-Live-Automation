@@ -84,9 +84,8 @@ public:
 
     void setExternalProps (juce::PropertySet* s);
 
-#if JUCE_IOS
     AbletonLink m_link;
-#endif
+
 private:
     // TAP CC ÄNDRING: Deklarera metoden för Tap-logik
     bool handleTapTempo(uint32_t nowMs);
@@ -127,6 +126,9 @@ private:
     float lastCutoffHz { -1.0f };
     float lastMasterGainDb { -1000.0f };
     float masterGainMultiplier { 1.0f };
+    
+    // DSP-Optimering: En pre-allokerad MIDI-buffer för att undvika minnesallokering (malloc) i ljudtråden
+    juce::MidiBuffer passThroughMidi;
     //==============================================================================
     // Parameters
     std::atomic<float> tickMultiplier {1.0f};
@@ -156,4 +158,11 @@ private:
     std::atomic<int> uiDenominator { -1 };
     std::atomic<int> uiIsPlaying { -1 };
     std::atomic<int> uiUseHost { -1 };
+
+    // Variabler för att avgöra om GUI/Preset ändrade inställningarna lokalt
+    float lastSettingsBpm { 120.0f };
+    bool lastSettingsIsPlaying { true };
+
+    // Skydd för kontinuerliga sustain-pedaler (Half-Damper)
+    bool lastMidiCC64State { false };
 }; // end class TickAudioProcessor

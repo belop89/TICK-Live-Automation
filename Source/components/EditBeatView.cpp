@@ -310,8 +310,18 @@ void EditBeatView::SamplesModel::SampleOption::mouseDown (const juce::MouseEvent
                 {
                     if (! safeThis->owner.selection.empty())
                     {
-                        auto& assignment = safeThis->owner.state.beatAssignments[safeThis->owner.selection.front()];
-                        assignment.tickIdx.setValue (std::max (0, assignment.tickIdx.get() - 1), nullptr);
+                        // UI-Optimering / Buggfix: När en ljudfil raderas måste vi uppdatera ALLA
+                        // slag som pekar på denna, eller filer efter den, så indexen inte blir korrupta!
+                        const int deletedRow = safeThis->row;
+                        for (int i = 0; i < TickSettings::kMaxBeatAssignments; ++i)
+                        {
+                            auto& assign = safeThis->owner.state.beatAssignments[i];
+                            const int currentIdx = assign.tickIdx.get();
+                            if (currentIdx == deletedRow)
+                                assign.tickIdx.setValue (0, nullptr); // Fallback till första ljudet
+                            else if (currentIdx > deletedRow)
+                                assign.tickIdx.setValue (currentIdx - 1, nullptr); // Skifta ner ett steg
+                        }
                         safeThis->owner.ticks.removeTick (safeThis->row);
                     }
                     break;
@@ -423,7 +433,7 @@ inline bool EditBeatView::SamplesModel::isLastRow (int row) const
 
 void EditBeatView::SamplesModel::listBoxItemClicked (int row, const juce::MouseEvent&)
 {
-    if (! isLastRow (row) && owner.selection.size() > 0)
+    if (row >= 0 && ! isLastRow (row) && owner.selection.size() > 0)
     {
         owner.state.beatAssignments[owner.selection.front()].tickIdx = row;
         owner.updateSelection (owner.selection);

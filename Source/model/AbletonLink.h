@@ -1,29 +1,32 @@
 #pragma once
 
 #include <JuceHeader.h>
+#include <ableton/Link.hpp>
 #include <optional>
+#include <memory>
 
-#if JUCE_IOS
-#include "ABLLink.h"
 class AbletonLink
 {
 public:
-    AbletonLink (double initBpm = 120.0);
-    ~AbletonLink();
-    void showSettings (juce::Component& source, std::function<void()> onDismiss);
-
-    bool isLinkEnabled();
-    bool isLinkConnected();
-
     struct Requests
     {
         std::optional<bool> isPlaying;
-        std::optional<float> bpm;
+        std::optional<double> bpm;
+        std::optional<double> forceBeatAtTime;
     };
 
-    // to be used on audio callback for the actual 'Link' sync
-    void linkPosition (juce::AudioPlayHead::PositionInfo&, Requests);
+    AbletonLink();
+    ~AbletonLink();
+
+    bool isLinkConnected() const;
+    void linkPosition (juce::AudioPlayHead::PositionInfo& posInfo, const Requests& requests);
+    
+    // Möjliggör av/på-slag av nätverkssynken
+    void setEnabled (bool shouldBeEnabled);
+    bool isEnabled() const;
+
 private:
-    ABLLinkRef ablLink;
+    std::unique_ptr<ableton::Link> link;
+    
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AbletonLink)
 };
-#endif
