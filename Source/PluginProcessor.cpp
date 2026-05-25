@@ -22,6 +22,9 @@ using namespace juce;
 const juce::String TickAudioProcessor::kTapTempoButtonID = "tap_tempo";
 const juce::String TickAudioProcessor::kMidiNoteBeat1ID = "midiNoteBeat1";
 const juce::String TickAudioProcessor::kMidiNoteOtherID = "midiNoteOther";
+const juce::String TickAudioProcessor::kMidiCcBpmID = "midiCcBpm";
+const juce::String TickAudioProcessor::kMidiCcTapID = "midiCcTap";
+const juce::String TickAudioProcessor::kMidiChannelInID = "midiChannelIn";
 //==============================================================================
 
 AudioProcessor::BusesProperties TickAudioProcessor::getDefaultLayout()
@@ -74,7 +77,16 @@ TickAudioProcessor::TickAudioProcessor()
                                                      0, 127, 34),
           std::make_unique<juce::AudioParameterInt> (ParameterID (kMidiNoteOtherID, 1), 
                                                      "MIDI Note (Other)", 
-                                                     0, 127, 33)
+                                                     0, 127, 33),
+          std::make_unique<juce::AudioParameterInt> (ParameterID (kMidiCcBpmID, 1), 
+                                                     "MIDI CC In: Set BPM", 
+                                                     0, 127, 119),
+          std::make_unique<juce::AudioParameterInt> (ParameterID (kMidiCcTapID, 1), 
+                                                     "MIDI CC In: Tap Tempo", 
+                                                     0, 127, 64),
+          std::make_unique<juce::AudioParameterInt> (ParameterID (kMidiChannelInID, 1), 
+                                                     "MIDI Input Channel (0=Omni)", 
+                                                     0, 16, 0)
       })
 {
     // init samples reading
@@ -86,6 +98,9 @@ TickAudioProcessor::TickAudioProcessor()
     tapTempoParam = dynamic_cast<juce::AudioParameterBool*> (parameters.getParameter (kTapTempoButtonID));
     midiNoteBeat1Param = parameters.getRawParameterValue (kMidiNoteBeat1ID);
     midiNoteOtherParam = parameters.getRawParameterValue (kMidiNoteOtherID);
+    midiCcBpmParam = parameters.getRawParameterValue (kMidiCcBpmID);
+    midiCcTapParam = parameters.getRawParameterValue (kMidiCcTapID);
+    midiChannelInParam = parameters.getRawParameterValue (kMidiChannelInID);
 
     // load default preset
     setStateInformation (BinaryData::factory_default_preset, BinaryData::factory_default_presetSize);
@@ -290,6 +305,9 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     // DSP-Optimering: Läs in MIDI-parametrar EN gång per block istället för varje tick
     const int currentNote1 = midiNoteBeat1Param ? juce::roundToInt(midiNoteBeat1Param->load(std::memory_order_relaxed)) : 34;
     const int currentNoteOther = midiNoteOtherParam ? juce::roundToInt(midiNoteOtherParam->load(std::memory_order_relaxed)) : 33;
+    const int currentCcBpm = midiCcBpmParam ? juce::roundToInt(midiCcBpmParam->load(std::memory_order_relaxed)) : 119;
+    const int currentCcTap = midiCcTapParam ? juce::roundToInt(midiCcTapParam->load(std::memory_order_relaxed)) : 64;
+    const int currentMidiChannelIn = midiChannelInParam ? juce::roundToInt(midiChannelInParam->load(std::memory_order_relaxed)) : 0;
 
     bool forceSongRestart = false;
     bool tapTriggered = false;
@@ -310,23 +328,32 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                 const int status = data[0] & 0xF0;
                 const int channel = (data[0] & 0x0F) + 1;
                 
-                // --- NY FUNKTION: Universell BPM-mottagning (Kanal 10, 11 & 12) ---
-                if (status == 0xC0 || status == 0x90 || status == 0xB0)
-                {
-                    int val = -1;
-                    if (status == 0xC0) val = data[1]; // Program Change
-                    else if (status == 0x90 && metadata.numBytes >= 3 && data[2] > 0) val = data[1]; // Note On (velocity > 0)
-                    else if (status == 0xB0 && metadata.numBytes >= 3 && data[1] == 119) val = data[2]; // Control Change (CC)
+                // --- NY FUNKTION (FELSÖKT & OPTIMERAD): MIDI Channel Wrapping ---
+                // Om användaren sätter inmatningskanalen till 15 eller 16, skulle de gamla 
+                // +1 / +2 beräkningarna hamna på ogiltiga MIDI-kanaler (17 & 18).
+                // Genom modulo-matematik (% 16) "wrappar" vi nu snyggt runt kanalsystemet! 
+                // Exempel: Bas-kanal 16 ger +100 BPM på kanal 1, och +200 BPM på kanal 2!
+                const int baseChan = currentMidiChannelIn > 0 ? currentMidiChannelIn : 0;
+                const int plus100Chan = baseChan > 0 ? ((baseChan % 16) + 1) : 0;
+                const int plus200Chan = baseChan > 0 ? (((baseChan + 1) % 16) + 1) : 0;
 
-                    // --- NY FUNKTION: Helix Tap Tempo Direkt via MIDI ---
-                    // Låter TICK lyssna på CC 64 (Sustain) direkt från Helix som en Tap-knapp!
-                    // Säkerhet: Begränsa till Kanal 10-12 så inte vanliga keyboard-pedaler (Kanal 1) förstör tempot!
-                    if (status == 0xB0 && metadata.numBytes >= 3 && data[1] == 64 && channel >= 10 && channel <= 12)
+                const bool isMainChannel = (baseChan == 0 || channel == baseChan);
+                const bool isPlus100Channel = (baseChan > 0 && channel == plus100Chan);
+                const bool isPlus200Channel = (baseChan > 0 && channel == plus200Chan);
+
+                if (isMainChannel || isPlus100Channel || isPlus200Channel)
+                {
+                    // 1. Hantera Tap Tempo (CC) - Endast på huvudkanalen
+                    if (isMainChannel && status == 0xB0 && metadata.numBytes >= 3 && data[1] == currentCcTap)
                     {
-                        isTempoCommand = true; // Förbruka alltid signalen så den inte blöder igenom
+                        // Säkerhet: Förbruka ENDAST kommandot (isTempoCommand = true) 
+                        // om vi ÄR PÅ en specifik kanal. Om OMNI (0) är valt släpper vi igenom 
+                        // CC-signalen så att användarens vanliga keyboard-pedaler inte slutar fungera!
+                        if (baseChan > 0)
+                            isTempoCommand = true; 
+                            
                         const bool currentMidiTapState = (data[2] >= 64);
                         
-                        // Säkerhet: Edge-Detection för att förhindra att kontinuerliga pedaler spammar metronomen!
                         if (currentMidiTapState && !lastMidiCC64State)
                         {
                             if (handleTapTempo(blockTimeMs))
@@ -334,27 +361,50 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                         }
                         lastMidiCC64State = currentMidiTapState;
                     }
-                // FIX: Ändra val > 0 till val >= 0. Annars ignoreras Program Change 0 på Kanal 11 och 12
-                // vilket skapade ett "svart hål" där metronomen vägrade byta till exakt 100 BPM eller 200 BPM!
-                else if (val >= 0 && channel >= 10 && channel <= 12)
+                    else // <--- FELSÖKNING: Mutually Exclusive (Förhindrar konflikt om Tap och BPM mappats till samma CC)
                     {
-                        double newBpm = 0.0;
-                        if (channel == 10) newBpm = val;
-                        else if (channel == 11) newBpm = val + 100.0;
-                        else if (channel == 12) newBpm = val + 200.0;
-
-                        if (newBpm > 0.0)
+                        // 2. Hantera Explicit BPM-ändring (Endast Program Change och CC BPM)
+                        int val = -1;
+                        bool isProgramChange = false;
+                        
+                        if (status == 0xC0) 
                         {
-                            isTempoCommand = true; // Markera som förbrukad, skicka ej vidare!
-                            uiUseHost.store(0, std::memory_order_relaxed);
-                            uiBpm.store((float)newBpm, std::memory_order_relaxed);
-                            uiIsPlaying.store(1, std::memory_order_relaxed);
-                            triggerAsyncUpdate();
-                            forceSongRestart = true;
-                            
-                            // Logik-Fix: Rensa Tap-minnet så att Helix-pedalen inte blockeras 
-                            // av sitt eget "drift-skydd" ifall den nya låten har ett drastiskt annorlunda tempo!
-                            ticks.tapModel.clear();
+                            val = data[1]; // Program Change
+                            isProgramChange = true;
+                        }
+                        else if (status == 0xB0 && metadata.numBytes >= 3 && data[1] == currentCcBpm) 
+                        {
+                            val = data[2]; // Control Change (CC)
+                        }
+
+                        if (val >= 0)
+                        {
+                            double newBpm = val;
+                            if (isPlus100Channel) newBpm += 100.0;
+                            else if (isPlus200Channel) newBpm += 200.0;
+
+                            if (newBpm > 0.0)
+                            {
+                                if (baseChan > 0)
+                                    isTempoCommand = true; // Markera som förbrukad, skicka ej vidare!
+
+                                const bool isCurrentlyPlaying = (uiIsPlaying.load(std::memory_order_relaxed) == 1) || playheadPosition_.getIsPlaying();
+
+                                // FIX: "CC Sweep Stutter"-buggen! 
+                                // Om användaren mappar BPM till en kontinuerlig CC-ratt och sveper den, 
+                                // startar vi ENDAST om fasen och låten om kommandot var ett Patch-byte 
+                                // (Program Change) eller om metronomen stod helt stilla.
+                                if (isProgramChange || !isCurrentlyPlaying)
+                                {
+                                    uiIsPlaying.store(1, std::memory_order_relaxed);
+                                    forceSongRestart = true;
+                                    ticks.tapModel.clear();
+                                }
+                                
+                                uiUseHost.store(0, std::memory_order_relaxed);
+                                uiBpm.store((float)newBpm, std::memory_order_relaxed);
+                                triggerAsyncUpdate();
+                            }
                         }
                     }
                 }
