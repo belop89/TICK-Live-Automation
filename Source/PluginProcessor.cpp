@@ -24,7 +24,6 @@ const juce::String TickAudioProcessor::kMidiNoteBeat1ID = "midiNoteBeat1";
 const juce::String TickAudioProcessor::kMidiNoteOtherID = "midiNoteOther";
 const juce::String TickAudioProcessor::kMidiCcBpmID = "midiCcBpm";
 const juce::String TickAudioProcessor::kMidiCcTapID = "midiCcTap";
-const juce::String TickAudioProcessor::kMidiChannelInID = "midiChannelIn";
 //==============================================================================
 
 AudioProcessor::BusesProperties TickAudioProcessor::getDefaultLayout()
@@ -83,10 +82,7 @@ TickAudioProcessor::TickAudioProcessor()
                                                      0, 127, 119),
           std::make_unique<juce::AudioParameterInt> (ParameterID (kMidiCcTapID, 1), 
                                                      "MIDI CC In: Tap Tempo", 
-                                                     0, 127, 64),
-          std::make_unique<juce::AudioParameterInt> (ParameterID (kMidiChannelInID, 1), 
-                                                     "MIDI Input Channel (0=Omni)", 
-                                                     0, 16, 0)
+                                                     0, 127, 64)
       })
 {
     // init samples reading
@@ -100,7 +96,6 @@ TickAudioProcessor::TickAudioProcessor()
     midiNoteOtherParam = parameters.getRawParameterValue (kMidiNoteOtherID);
     midiCcBpmParam = parameters.getRawParameterValue (kMidiCcBpmID);
     midiCcTapParam = parameters.getRawParameterValue (kMidiCcTapID);
-    midiChannelInParam = parameters.getRawParameterValue (kMidiChannelInID);
 
     // load default preset
     setStateInformation (BinaryData::factory_default_preset, BinaryData::factory_default_presetSize);
@@ -217,8 +212,9 @@ void TickAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     // FIX: Allokera filtret efter DAW:ens aktuella buffertstorlek, inte 10 sekunder. 
     // Det sparar massivt med onödigt RAM-minne (upp till flera megabyte per instans)!
     spec.maximumBlockSize = (uint32_t)juce::jmax(1, samplesPerBlock);
-    // FIX: Sätt kanalantalet till dynamiskt (oftast 2 för Stereo) för att undvika minneskrasch i filtret
-    spec.numChannels = (uint32_t)juce::jmax(1, getTotalNumOutputChannels());
+    // DSP-Säkerhet: Garantera alltid MINST Stereo (2). Vissa DAW:s rapporterar 0 utgångar 
+    // under laddningssekvensen, vilket annars får filtret att allokera för lite minne och krascha!
+    spec.numChannels = (uint32_t)juce::jmax(2, getTotalNumOutputChannels());
     lpfFilter.prepare(spec);
     lpfFilter.setType(juce::dsp::StateVariableTPTFilterType::lowpass);
     lpfFilter.reset();
@@ -307,7 +303,6 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     const int currentNoteOther = midiNoteOtherParam ? juce::roundToInt(midiNoteOtherParam->load(std::memory_order_relaxed)) : 33;
     const int currentCcBpm = midiCcBpmParam ? juce::roundToInt(midiCcBpmParam->load(std::memory_order_relaxed)) : 119;
     const int currentCcTap = midiCcTapParam ? juce::roundToInt(midiCcTapParam->load(std::memory_order_relaxed)) : 64;
-    const int currentMidiChannelIn = midiChannelInParam ? juce::roundToInt(midiChannelInParam->load(std::memory_order_relaxed)) : 0;
 
     bool forceSongRestart = false;
     bool tapTriggered = false;
@@ -328,84 +323,69 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                 const int status = data[0] & 0xF0;
                 const int channel = (data[0] & 0x0F) + 1;
                 
-                // --- NY FUNKTION (FELSÖKT & OPTIMERAD): MIDI Channel Wrapping ---
-                // Om användaren sätter inmatningskanalen till 15 eller 16, skulle de gamla 
-                // +1 / +2 beräkningarna hamna på ogiltiga MIDI-kanaler (17 & 18).
-                // Genom modulo-matematik (% 16) "wrappar" vi nu snyggt runt kanalsystemet! 
-                // Exempel: Bas-kanal 16 ger +100 BPM på kanal 1, och +200 BPM på kanal 2!
-                const int baseChan = currentMidiChannelIn > 0 ? currentMidiChannelIn : 0;
-                const int plus100Chan = baseChan > 0 ? ((baseChan % 16) + 1) : 0;
-                const int plus200Chan = baseChan > 0 ? (((baseChan + 1) % 16) + 1) : 0;
-
-                const bool isMainChannel = (baseChan == 0 || channel == baseChan);
-                const bool isPlus100Channel = (baseChan > 0 && channel == plus100Chan);
-                const bool isPlus200Channel = (baseChan > 0 && channel == plus200Chan);
-
-                if (isMainChannel || isPlus100Channel || isPlus200Channel)
+                // =========================================================================
+                // ZERO ALLOCATION: EXPLICIT HUNDRATALS-LOGIK & BRANDVÄGG
+                // =========================================================================
+                if (status == 0xB0 && metadata.numBytes >= 3) // Endast Control Change
                 {
-                    // 1. Hantera Tap Tempo (CC) - Endast på huvudkanalen
-                    if (isMainChannel && status == 0xB0 && metadata.numBytes >= 3 && data[1] == currentCcTap)
+                    const int cc = data[1];
+                    const int val = data[2];
+
+                    // ---------------------------------------------------------
+                    // 1. SONGBOOK: Absolut Tempo via Hundratals-logiken
+                    // ---------------------------------------------------------
+                    if (cc == currentCcBpm)
                     {
-                        // Säkerhet: Förbruka ENDAST kommandot (isTempoCommand = true) 
-                        // om vi ÄR PÅ en specifik kanal. Om OMNI (0) är valt släpper vi igenom 
-                        // CC-signalen så att användarens vanliga keyboard-pedaler inte slutar fungera!
-                        if (baseChan > 0)
-                            isTempoCommand = true; 
-                            
-                        const bool currentMidiTapState = (data[2] >= 64);
+                        double newBpm = -1.0;
                         
+                        // Explicit hårdkodning: Olika kanaler är olika hundratal!
+                        if (channel == 10)      newBpm = val;           // 0 - 99 BPM
+                        else if (channel == 11) newBpm = val + 100.0;   // 100 - 199 BPM
+                        else if (channel == 12) newBpm = val + 200.0;   // 200 - 299 BPM
+
+                        if (newBpm >= 0.0) // Endast om signalen kom på rätt kanal
+                        {
+                            isTempoCommand = true; // Förhindra alltid blödning till DAW
+                            
+                            // Fail-Safe: Klampa tempot för Ableton Link (20-300).
+                            // Förhindrar "svarta hål" om användaren av misstag skickar ett för lågt värde!
+                            const double safeBpm = juce::jlimit(20.0, 300.0, newBpm);
+                            
+                            // Eftersom kanaler nu är hårdkodade vet vi att detta är ett låtbyte.
+                            // Om metronomen stod stilla, ELLER om tempot ändras, startar vi om fasen (Beat 1).
+                            const bool isCurrentlyPlaying = (uiIsPlaying.load(std::memory_order_relaxed) == 1) || playheadPosition_.getIsPlaying();
+                            if (!isCurrentlyPlaying || std::abs(safeBpm - playheadPosition_.getBpm().orFallback(120.0)) > 0.5)
+                            {
+                                forceSongRestart = true;
+                                ticks.tapModel.clear();
+                            }
+
+                            // Trådsäker uppdatering av gränssnitt och DSP
+                            uiUseHost.store(0, std::memory_order_relaxed);
+                            uiBpm.store((float)safeBpm, std::memory_order_relaxed);
+                            uiIsPlaying.store(1, std::memory_order_relaxed);
+                            playheadPosition_.setBpm(safeBpm);
+                            playheadPosition_.setIsPlaying(true);
+                            triggerAsyncUpdate();
+                        }
+                    }
+
+                    // ---------------------------------------------------------
+                    // 2. HELIX: Tap Tempo (Manuellt)
+                    // ---------------------------------------------------------
+                    // Enligt officiell MIDI-karta sker Helix Master Control på Kanal 14
+                    else if (cc == currentCcTap && channel == 14)
+                    {
+                        isTempoCommand = true; // Förhindra blödning till DAW
+                        
+                        const bool currentMidiTapState = (val >= 64);
+                        // Defensiv Edge-detection: Trigga bara vid nedtramp
                         if (currentMidiTapState && !lastMidiCC64State)
                         {
                             if (handleTapTempo(blockTimeMs))
                                 tapTriggered = true;
                         }
                         lastMidiCC64State = currentMidiTapState;
-                    }
-                    else // <--- FELSÖKNING: Mutually Exclusive (Förhindrar konflikt om Tap och BPM mappats till samma CC)
-                    {
-                        // 2. Hantera Explicit BPM-ändring (Endast Program Change och CC BPM)
-                        int val = -1;
-                        bool isProgramChange = false;
-                        
-                        if (status == 0xC0) 
-                        {
-                            val = data[1]; // Program Change
-                            isProgramChange = true;
-                        }
-                        else if (status == 0xB0 && metadata.numBytes >= 3 && data[1] == currentCcBpm) 
-                        {
-                            val = data[2]; // Control Change (CC)
-                        }
-
-                        if (val >= 0)
-                        {
-                            double newBpm = val;
-                            if (isPlus100Channel) newBpm += 100.0;
-                            else if (isPlus200Channel) newBpm += 200.0;
-
-                            if (newBpm > 0.0)
-                            {
-                                if (baseChan > 0)
-                                    isTempoCommand = true; // Markera som förbrukad, skicka ej vidare!
-
-                                const bool isCurrentlyPlaying = (uiIsPlaying.load(std::memory_order_relaxed) == 1) || playheadPosition_.getIsPlaying();
-
-                                // FIX: "CC Sweep Stutter"-buggen! 
-                                // Om användaren mappar BPM till en kontinuerlig CC-ratt och sveper den, 
-                                // startar vi ENDAST om fasen och låten om kommandot var ett Patch-byte 
-                                // (Program Change) eller om metronomen stod helt stilla.
-                                if (isProgramChange || !isCurrentlyPlaying)
-                                {
-                                    uiIsPlaying.store(1, std::memory_order_relaxed);
-                                    forceSongRestart = true;
-                                    ticks.tapModel.clear();
-                                }
-                                
-                                uiUseHost.store(0, std::memory_order_relaxed);
-                                uiBpm.store((float)newBpm, std::memory_order_relaxed);
-                                triggerAsyncUpdate();
-                            }
-                        }
                     }
                 }
             }
@@ -430,14 +410,10 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
 
         if (curState && ! prevState)
         {
-            // Suppress if global tap debounce hasn't expired
-            constexpr uint32_t kTapDebounceMs = 80;
-            const uint32_t lastTapMs = lastTapTimeMs.load(std::memory_order_relaxed);
-            if (lastTapMs == 0 || (blockTimeMs - lastTapMs) >= kTapDebounceMs)
-            {
-                if (handleTapTempo(blockTimeMs))
-                    tapTriggered = true;
-            }
+            // DSP-Optimering: Redundant debounce-kod borttagen. 
+            // handleTapTempo() sköter redan en skottsäker 150ms debounce internt!
+            if (handleTapTempo(blockTimeMs))
+                tapTriggered = true;
 
             // reset the parameter on message thread so host doesn't keep reporting it
             triggerAsyncUpdate();
@@ -661,10 +637,10 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                 uiBpm.store(newBpm, std::memory_order_relaxed);
                 triggerAsyncUpdate();
                     
-                    // DSP-Fix: Håll minnet synkat när DAW:en automatiserar tempot! 
-                    // Annars bryts Host Sync felaktigt i nästa ljudblock.
-                    if (isUseHost)
-                        lastSettingsBpm = newBpm;
+                // DSP-Fix: Håll minnet synkat när DAW:en automatiserar tempot! 
+                // Annars bryts Host Sync felaktigt i nästa ljudblock.
+                if (isUseHost)
+                    lastSettingsBpm = newBpm;
             }
         }
     }

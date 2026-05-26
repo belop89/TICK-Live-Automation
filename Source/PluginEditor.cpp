@@ -182,11 +182,6 @@ TickAudioProcessorEditor::TickAudioProcessorEditor (TickAudioProcessor& p)
         ccTapSlider->slider.setScrollWheelEnabled (false);
         settings.addSectionHeader ("MIDI CC In: Tap Tempo");
         settings.addCustomItem (227, std::move (ccTapSlider));
-
-        auto channelInSlider = std::make_unique<TickUtils::ParameterSliderItem> (tickProcessor.getAPVTS(), TickAudioProcessor::kMidiChannelInID);
-        channelInSlider->slider.setScrollWheelEnabled (false);
-        settings.addSectionHeader ("MIDI Input Channel (0 = Omni)");
-        settings.addCustomItem (228, std::move (channelInSlider));
         settings.addItem ("About", [this] {
             aboutView->setVisible (true);
         });
@@ -330,6 +325,32 @@ void TickAudioProcessorEditor::parentHierarchyChanged()
     // safe area only valid after view is visible.
     resized();
 #endif
+
+#if ! JUCE_IOS && ! JUCE_ANDROID
+    // --- GUI-FIX: Återställ ENDAST fönstrets position i Standalone-läge ---
+    // DAWs (Ableton, Cubase) ritar VST/AU-fönstret i en egen wrapper. Om vi flyttar 
+    // komponentens position inuti wrappern kommer metronomen glida ur bild och bli osynlig!
+    if (tickProcessor.wrapperType == juce::AudioProcessor::wrapperType_Standalone)
+    {
+        if (auto* tlc = getTopLevelComponent())
+        {
+            if (auto* props = appProperties.getUserSettings())
+            {
+                int savedX = props->getIntValue ("windowX", -1);
+                int savedY = props->getIntValue ("windowY", -1);
+
+                if (savedX != -1 && savedY != -1)
+                {
+                    // Säkerhetsspärr: Förhindra att fönstret hamnar utanför bild om en skärm kopplats ur!
+                    juce::Rectangle<int> savedRect (savedX, savedY, getWidth(), getHeight());
+                    if (auto* display = juce::Desktop::getInstance().getDisplays().getDisplayForRect (savedRect))
+                        if (display->userArea.intersects (savedRect))
+                            tlc->setTopLeftPosition (savedX, savedY);
+                }
+            }
+        }
+    }
+#endif
 }
 
 void TickAudioProcessorEditor::resized()
@@ -339,7 +360,10 @@ void TickAudioProcessorEditor::resized()
     topBar.removeChildComponent (&bottomBar);
     removeChildComponent (&bottomBar);
 
-    auto safeArea = Desktop::getInstance().getDisplays().getPrimaryDisplay()->safeAreaInsets;
+    juce::BorderSize<int> safeArea;
+    if (auto* display = Desktop::getInstance().getDisplays().getPrimaryDisplay())
+        safeArea = display->safeAreaInsets;
+        
     constexpr auto notchSafeSides = 32; // we are always being safe...
     const auto isRotatedAndNeeded =
 #if JUCE_IOS || JUCE_ANDROID
@@ -478,6 +502,30 @@ void TickAudioProcessorEditor::timerCallback()
         getProperties().set(lastWId, currentW);
         getProperties().set(lastHId, currentH);
         tickProcessor.getState().view.windowSize.setValue (juce::String (currentW) + "," + juce::String (currentH));
+    }
+
+    // --- GUI-FIX: Spara ENDAST fönstrets position i Standalone-läge ---
+    if (tickProcessor.wrapperType == juce::AudioProcessor::wrapperType_Standalone)
+    {
+        if (auto* tlc = getTopLevelComponent())
+        {
+            const int currentX = tlc->getScreenX();
+            const int currentY = tlc->getScreenY();
+            static const juce::Identifier lastXId ("lastX");
+            static const juce::Identifier lastYId ("lastY");
+            
+            if (currentX != (int)getProperties().getWithDefault (lastXId, -1) || 
+                currentY != (int)getProperties().getWithDefault (lastYId, -1))
+            {
+                getProperties().set (lastXId, currentX);
+                getProperties().set (lastYId, currentY);
+                if (auto* props = appProperties.getUserSettings())
+                {
+                    props->setValue ("windowX", currentX);
+                    props->setValue ("windowY", currentY);
+                }
+            }
+        }
     }
 #endif
 
