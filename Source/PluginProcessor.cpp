@@ -295,6 +295,11 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     bool forceSongRestart = false;
     bool tapTriggered = false;
 
+    // =========================================================================
+    // ZERO CONFIGURATION: Hårdkodade konstanter för branschstandard
+    // =========================================================================
+    constexpr int HARDCODED_CC_TAP = 64;
+
     // MIDI logging + robust single-tap detection (one rising-edge per controller, per-debounce)
     if (! midiMessages.isEmpty())
     {
@@ -311,31 +316,24 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                 const int status = data[0] & 0xF0;
                 const int channel = (data[0] & 0x0F) + 1;
                 
-                // =========================================================================
-                // ZERO CONFIGURATION: EXPLICIT HUNDRATALS-LOGIK & BRANDVÄGG
-                // =========================================================================
-                // Vi läser inte längre från GUI. Hårdkodad branschstandard för denna rigg!
-                const int HARDCODED_CC_BPM = 11;
-                const int HARDCODED_CC_TAP = 64;
-
                 if (status == 0xB0 && metadata.numBytes >= 3) // Endast Control Change
                 {
                     const int cc = data[1];
                     const int val = data[2];
 
                     // ---------------------------------------------------------
-                    // 1. SONGBOOK: Absolut Tempo (Lyssnar BARA på CC 11)
+                    // 1. SONGBOOK: Absolut Tempo (Lyssnar BARA på Kanal 10, CC 10-12)
                     // ---------------------------------------------------------
-                    if (cc == HARDCODED_CC_BPM)
+                    if (channel == 10 && (cc >= 10 && cc <= 12))
                     {
                         double newBpm = -1.0;
                         
-                        // Explicit hårdkodning: Olika kanaler är olika hundratal!
-                        if (channel == 10)      newBpm = val;           // 0 - 99 BPM
-                        else if (channel == 11) newBpm = val + 100.0;   // 100 - 199 BPM
-                        else if (channel == 12) newBpm = val + 200.0;   // 200 - 299 BPM
+                        // Explicit hårdkodning: Olika CC-nummer är olika hundratal!
+                        if (cc == 10)      newBpm = val;           // 0 - 99 BPM
+                        else if (cc == 11) newBpm = val + 100.0;   // 100 - 199 BPM
+                        else if (cc == 12) newBpm = val + 200.0;   // 200 - 299 BPM
 
-                        if (newBpm >= 0.0) // Endast om signalen kom på rätt kanal
+                        if (newBpm >= 0.0)
                         {
                             isTempoCommand = true; // Förhindra blödning till DAW
                             
