@@ -22,8 +22,6 @@ using namespace juce;
 const juce::String TickAudioProcessor::kTapTempoButtonID = "tap_tempo";
 const juce::String TickAudioProcessor::kMidiNoteBeat1ID = "midiNoteBeat1";
 const juce::String TickAudioProcessor::kMidiNoteOtherID = "midiNoteOther";
-const juce::String TickAudioProcessor::kMidiCcBpmID = "midiCcBpm";
-const juce::String TickAudioProcessor::kMidiCcTapID = "midiCcTap";
 //==============================================================================
 
 AudioProcessor::BusesProperties TickAudioProcessor::getDefaultLayout()
@@ -76,13 +74,7 @@ TickAudioProcessor::TickAudioProcessor()
                                                      0, 127, 34),
           std::make_unique<juce::AudioParameterInt> (ParameterID (kMidiNoteOtherID, 1), 
                                                      "MIDI Note (Other)", 
-                                                     0, 127, 33),
-          std::make_unique<juce::AudioParameterInt> (ParameterID (kMidiCcBpmID, 1), 
-                                                     "MIDI CC In: Set BPM", 
-                                                     0, 127, 119),
-          std::make_unique<juce::AudioParameterInt> (ParameterID (kMidiCcTapID, 1), 
-                                                     "MIDI CC In: Tap Tempo", 
-                                                     0, 127, 64)
+                                                     0, 127, 33)
       })
 {
     // init samples reading
@@ -94,8 +86,6 @@ TickAudioProcessor::TickAudioProcessor()
     tapTempoParam = dynamic_cast<juce::AudioParameterBool*> (parameters.getParameter (kTapTempoButtonID));
     midiNoteBeat1Param = parameters.getRawParameterValue (kMidiNoteBeat1ID);
     midiNoteOtherParam = parameters.getRawParameterValue (kMidiNoteOtherID);
-    midiCcBpmParam = parameters.getRawParameterValue (kMidiCcBpmID);
-    midiCcTapParam = parameters.getRawParameterValue (kMidiCcTapID);
 
     // load default preset
     setStateInformation (BinaryData::factory_default_preset, BinaryData::factory_default_presetSize);
@@ -301,8 +291,6 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     // DSP-Optimering: Läs in MIDI-parametrar EN gång per block istället för varje tick
     const int currentNote1 = midiNoteBeat1Param ? juce::roundToInt(midiNoteBeat1Param->load(std::memory_order_relaxed)) : 34;
     const int currentNoteOther = midiNoteOtherParam ? juce::roundToInt(midiNoteOtherParam->load(std::memory_order_relaxed)) : 33;
-    const int currentCcBpm = midiCcBpmParam ? juce::roundToInt(midiCcBpmParam->load(std::memory_order_relaxed)) : 119;
-    const int currentCcTap = midiCcTapParam ? juce::roundToInt(midiCcTapParam->load(std::memory_order_relaxed)) : 64;
 
     bool forceSongRestart = false;
     bool tapTriggered = false;
@@ -324,17 +312,21 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                 const int channel = (data[0] & 0x0F) + 1;
                 
                 // =========================================================================
-                // ZERO ALLOCATION: EXPLICIT HUNDRATALS-LOGIK & BRANDVÄGG
+                // ZERO CONFIGURATION: EXPLICIT HUNDRATALS-LOGIK & BRANDVÄGG
                 // =========================================================================
+                // Vi läser inte längre från GUI. Hårdkodad branschstandard för denna rigg!
+                const int HARDCODED_CC_BPM = 11;
+                const int HARDCODED_CC_TAP = 64;
+
                 if (status == 0xB0 && metadata.numBytes >= 3) // Endast Control Change
                 {
                     const int cc = data[1];
                     const int val = data[2];
 
                     // ---------------------------------------------------------
-                    // 1. SONGBOOK: Absolut Tempo via Hundratals-logiken
+                    // 1. SONGBOOK: Absolut Tempo (Lyssnar BARA på CC 11)
                     // ---------------------------------------------------------
-                    if (cc == currentCcBpm)
+                    if (cc == HARDCODED_CC_BPM)
                     {
                         double newBpm = -1.0;
                         
@@ -345,15 +337,13 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
 
                         if (newBpm >= 0.0) // Endast om signalen kom på rätt kanal
                         {
-                            isTempoCommand = true; // Förhindra alltid blödning till DAW
+                            isTempoCommand = true; // Förhindra blödning till DAW
                             
-                            // Fail-Safe: Klampa tempot för Ableton Link (20-300).
-                            // Förhindrar "svarta hål" om användaren av misstag skickar ett för lågt värde!
                             const double safeBpm = juce::jlimit(20.0, 300.0, newBpm);
                             
-                            // Eftersom kanaler nu är hårdkodade vet vi att detta är ett låtbyte.
-                            // Om metronomen stod stilla, ELLER om tempot ändras, startar vi om fasen (Beat 1).
                             const bool isCurrentlyPlaying = (uiIsPlaying.load(std::memory_order_relaxed) == 1) || playheadPosition_.getIsPlaying();
+
+                            // Fas-låsning (Beat 1 Snap) vid tempoändring eller start
                             if (!isCurrentlyPlaying || std::abs(safeBpm - playheadPosition_.getBpm().orFallback(120.0)) > 0.5)
                             {
                                 forceSongRestart = true;
@@ -371,10 +361,9 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                     }
 
                     // ---------------------------------------------------------
-                    // 2. HELIX: Tap Tempo (Manuellt)
+                    // 2. HELIX: Tap Tempo (Lyssnar BARA på CC 64 på Kanal 14)
                     // ---------------------------------------------------------
-                    // Enligt officiell MIDI-karta sker Helix Master Control på Kanal 14
-                    else if (cc == currentCcTap && channel == 14)
+                    else if (cc == HARDCODED_CC_TAP && channel == 14)
                     {
                         isTempoCommand = true; // Förhindra blödning till DAW
                         
@@ -446,7 +435,8 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         {
             // DSP-Optimering: Skicka RAW byte 0xFC (Stop) för att undvika instansiering
             const juce::uint8 midiStopData[1] = { 0xFC };
-            midiMessages.addEvent(midiStopData, 1, 0);
+            if (buffer.getNumSamples() > 0)
+                midiMessages.addEvent(midiStopData, 1, 0);
         }
 
         playheadPosition_.setPpqPosition(0.0);
@@ -455,7 +445,8 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         nextClockPpq = 0.0;
         // DSP-Optimering: Skicka RAW byte 0xFA (Start) för att undvika instansiering
         const juce::uint8 midiStartData[1] = { 0xFA };
-        midiMessages.addEvent(midiStartData, 1, 0);
+        if (buffer.getNumSamples() > 0)
+            midiMessages.addEvent(midiStartData, 1, 0);
         wasPlaying = true; // Förhindra dubbla midiStart längre ner
     }
     else if (tapTriggered)
@@ -690,17 +681,20 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     if (isPlaying && !wasPlaying)
     {
         const juce::uint8 midiStartData[1] = { 0xFA };
-        midiMessages.addEvent(midiStartData, 1, 0);
+        if (buffer.getNumSamples() > 0)
+            midiMessages.addEvent(midiStartData, 1, 0);
         nextClockPpq = playheadPosition_.getPpqPosition().orFallback(0.0);
     }
     else if (!isPlaying && wasPlaying)
     {
         const juce::uint8 midiStopData[1] = { 0xFC };
-        midiMessages.addEvent(midiStopData, 1, 0);
+        if (buffer.getNumSamples() > 0)
+            midiMessages.addEvent(midiStopData, 1, 0);
     }
     wasPlaying = isPlaying;
 
-    if (isPlaying)
+    // DSP-Säkerhet: Förhindra MIDI-klocka vid Flush-block (0 samples). Förhindrar wrapper-kraschar i DAW!
+    if (isPlaying && buffer.getNumSamples() > 0)
     {
         double currentPpq = playheadPosition_.getPpqPosition().orFallback(0.0);
         

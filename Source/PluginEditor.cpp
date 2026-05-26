@@ -172,16 +172,6 @@ TickAudioProcessorEditor::TickAudioProcessorEditor (TickAudioProcessor& p)
         settings.addSectionHeader ("MIDI Note: Other Beats");
         settings.addCustomItem (225, std::move (noteOtherSlider));
         settings.addSeparator();
-
-        auto ccBpmSlider = std::make_unique<TickUtils::ParameterSliderItem> (tickProcessor.getAPVTS(), TickAudioProcessor::kMidiCcBpmID);
-        ccBpmSlider->slider.setScrollWheelEnabled (false);
-        settings.addSectionHeader ("MIDI CC In: Set BPM");
-        settings.addCustomItem (226, std::move (ccBpmSlider));
-
-        auto ccTapSlider = std::make_unique<TickUtils::ParameterSliderItem> (tickProcessor.getAPVTS(), TickAudioProcessor::kMidiCcTapID);
-        ccTapSlider->slider.setScrollWheelEnabled (false);
-        settings.addSectionHeader ("MIDI CC In: Tap Tempo");
-        settings.addCustomItem (227, std::move (ccTapSlider));
         settings.addItem ("About", [this] {
             aboutView->setVisible (true);
         });

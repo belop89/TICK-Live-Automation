@@ -30,8 +30,6 @@ public:
     static const juce::String kTapTempoButtonID; 
     static const juce::String kMidiNoteBeat1ID;
     static const juce::String kMidiNoteOtherID;
-    static const juce::String kMidiCcBpmID;
-    static const juce::String kMidiCcTapID;
     //==============================================================================
     
     TickAudioProcessor();
@@ -138,8 +136,6 @@ private:
     std::atomic<float>* masterGain;
     std::atomic<float>* midiNoteBeat1Param { nullptr };
     std::atomic<float>* midiNoteOtherParam { nullptr };
-    std::atomic<float>* midiCcBpmParam { nullptr };
-    std::atomic<float>* midiCcTapParam { nullptr };
     juce::AudioParameterBool* tapTempoParam { nullptr };
     juce::AudioProcessorValueTreeState parameters;
     //==============================================================================
