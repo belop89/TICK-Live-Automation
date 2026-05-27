@@ -34,7 +34,7 @@ include(CPack)
 
 if(APPLE)
     if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-        set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "Minimum OS X deployment version")
+        set(CMAKE_OSX_DEPLOYMENT_TARGET "10.14" CACHE STRING "Minimum OS X deployment version")
         set(ICON "tick_icon_macOS.png")
         set(HARDENED_RUNTIME $<IF:$<CONFIG:Debug>,NO,YES>)
     endif()

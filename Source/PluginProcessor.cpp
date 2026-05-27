@@ -276,12 +276,14 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     
     // DSP-Optimering: Tvinga hostens (DAW:ens) MIDI-buffer att ha tillräcklig kapacitet!
     // Vissa DAW:s skickar in buffertar med 0 bytes minneskapacitet om inga inkommande noter finns.
-    // När vi sedan fyller på med våra egna 24 MIDI-klockpulser per fjärdedelsnot, tvingas bufferten
-    // utföra dolda RAM-allokeringar (malloc) på ljudtråden. Detta förhindrar det helt!
-    midiMessages.ensureSize(2048);
+    // För att överleva "Offline Bouncing" (där DAW:en kan skicka 65536 samples per block) och 
+    // extremt snabba tempon (400 BPM) utan att 'malloc' triggas på ljudtråden när vi genererar 
+    // hundratals MIDI-klockpulser, maximerar vi bufferten till 8192 bytes.
+    midiMessages.ensureSize(8192);
 
     // 0. OS-Optimering: Hämta aktuell tid en enda gång per ljudblock för att undvika onödiga systemanrop
     const uint32_t blockTimeMs = juce::Time::getMillisecondCounter();
+    const double currentSampleRate = juce::jmax(44.0, getSampleRate()); // Garantera minst 44Hz
 
     // 1. Läs in atomics EN gång per block till lokala variabler för max prestanda
     const float currentFilterCutoff = filterCutoff->load(std::memory_order_relaxed);
@@ -303,6 +305,7 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     // MIDI logging + robust single-tap detection (one rising-edge per controller, per-debounce)
     if (! midiMessages.isEmpty())
     {
+        bool consumedAnyTempo = false;
         passThroughMidi.clear();
 
         for (const auto metadata : midiMessages)
@@ -322,22 +325,24 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                     const int val = data[2];
 
                     // ---------------------------------------------------------
-                    // 1. SONGBOOK: Absolut Tempo (Lyssnar BARA på Kanal 10, CC 10-12)
+                    // 1. SONGBOOK: Absolut Tempo (Lyssnar BARA på Kanal 10, CC 0-3)
                     // ---------------------------------------------------------
-                    if (channel == 10 && (cc >= 10 && cc <= 12))
+                    if (channel == 10 && (cc >= 0 && cc <= 3))
                     {
                         double newBpm = -1.0;
                         
                         // Explicit hårdkodning: Olika CC-nummer är olika hundratal!
-                        if (cc == 10)      newBpm = val;           // 0 - 99 BPM
-                        else if (cc == 11) newBpm = val + 100.0;   // 100 - 199 BPM
-                        else if (cc == 12) newBpm = val + 200.0;   // 200 - 299 BPM
+                        if (cc == 0)      newBpm = val;           // 0 - 99 BPM
+                        else if (cc == 1) newBpm = val + 100.0;   // 100 - 199 BPM
+                        else if (cc == 2) newBpm = val + 200.0;   // 200 - 299 BPM
+                        else if (cc == 3) newBpm = val + 300.0;   // 300 - 399 BPM
 
                         if (newBpm >= 0.0)
                         {
                             isTempoCommand = true; // Förhindra blödning till DAW
                             
-                            const double safeBpm = juce::jlimit(20.0, 300.0, newBpm);
+                            // Fail-Safe: Klampa tempot för Ableton Link (20-400).
+                            const double safeBpm = juce::jlimit(20.0, 400.0, newBpm);
                             
                             const bool isCurrentlyPlaying = (uiIsPlaying.load(std::memory_order_relaxed) == 1) || playheadPosition_.getIsPlaying();
 
@@ -375,6 +380,9 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                         lastMidiCC64State = currentMidiTapState;
                     }
                 }
+
+                if (isTempoCommand)
+                    consumedAnyTempo = true;
             }
 
             // Släpp igenom alla MIDI-signaler som INTE var metronomens tempo-byten (t.ex Kanal 16)
@@ -382,11 +390,13 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
                 passThroughMidi.addEvent (metadata.data, metadata.numBytes, metadata.samplePosition);
         }
         
-        // DSP-Optimering: Använd INTE swapWith()! Det byter ut din 8192-bytes pre-allokerade buffer 
-        // mot DAW:ens lilla buffer, vilket förstör optimeringen och skapar 'mallocs' på ljudtråden.
-        // Använd clear() och addEvents() för att säkert kopiera in datan istället!
-        midiMessages.clear();
-        midiMessages.addEvents(passThroughMidi, 0, -1, 0);
+        // DSP-Optimering (O(1) Passthrough): Om ingen MIDI-signal var till för metronomen 
+        // (vilket är fallet 99.9% av tiden), skippar vi att kopiera och skriva över bufferten helt!
+        if (consumedAnyTempo)
+        {
+            midiMessages.clear();
+            midiMessages.addEvents(passThroughMidi, 0, -1, 0);
+        }
     }
 
     // 1. Endast trigga på stigande flank (rising edge) för att undvika dubbel-triggering
@@ -566,9 +576,9 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         if (m_link.isLinkConnected())
         {
             AbletonLink::Requests hostRequests;
-            // Säkerhet: Vissa DAW:s skickar 0.0 BPM vid laddning/hopp. Om vi trycker in 0.0 
-            // i Ableton Link kraschar nätverkets underliggande fas-matematik (division med noll).
-            const double hostBpm = juce::jmax(20.0, playheadPosition_.getBpm().orFallback(120.0));
+            // Säkerhet: Klampa DAW-tempot (20-400) för att matcha Songbook och skydda Ableton Link.
+            // Förhindrar kraschar om DAW:en skickar 0.0 vid laddning, eller om tempo-spåret spikar orimligt högt!
+            const double hostBpm = juce::jlimit(20.0, 400.0, playheadPosition_.getBpm().orFallback(120.0));
             const bool hostIsPlaying = playheadPosition_.getIsPlaying();
             
             bool needsPush = false;
@@ -667,8 +677,7 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     // (annars uppdateras inte filtret när du skruvar på det medan DAW:en står stilla!)
     // Säkerhet: Begränsa cutoff BÅDE i botten (20Hz) och toppen (Nyquist) för att förhindra
     // att filtret exploderar (NaN/krasch) ifall DAW-automationen drar värdet under 0!
-    const double actualSr = juce::jmax(44.0, getSampleRate()); // Garantera minst 44Hz så Nyquist alltid är > 20Hz!
-    const float safeCutoff = (float) juce::jlimit(20.0, (actualSr / 2.0) - 1.0, (double)currentFilterCutoff);
+    const float safeCutoff = (float) juce::jlimit(20.0, (currentSampleRate / 2.0) - 1.0, (double)currentFilterCutoff);
     
     if (lastCutoffHz != safeCutoff)
     {
@@ -710,9 +719,8 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         // Säkerhetsspärr: Förhindra division med noll (vilket fryser DAW:en) om BPM saknas
         if (bpm <= 0.0) bpm = 120.0;
         
-        double sr = juce::jmax(1.0, getSampleRate()); // Säkerhetsspärr mot sr=0
         // DSP-Optimering: (sr * 60.0) / bpm sparar processorn från en extra flyttalsdivision!
-        double samplesPerQuarter = (sr * 60.0) / bpm;
+        double samplesPerQuarter = (currentSampleRate * 60.0) / bpm;
         
         // Beräkna var i denna buffer (PPQ) vi befinner oss
         double bufEndPpq = currentPpq + (buffer.getNumSamples() / samplesPerQuarter);
@@ -763,8 +771,7 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         // FIX: Förhindra negativ tid vid floating-point avrundningsfel från DAW:en
         const auto pos = juce::jmax(0.0, ppqPosition - lastBarStart);
         const auto bps = bpm / 60.0;
-        const double sr = juce::jmax(1.0, getSampleRate()); // Säkerhetsspärr mot sr=0
-        const auto bpSmp = (sr * 60.0) / bpm; // DSP-Optimering: Matematiskt förenklat för att slippa division
+        const auto bpSmp = (currentSampleRate * 60.0) / bpm; // DSP-Optimering: Matematiskt förenklat för att slippa division
         const auto ttq = (4.0 / juce::jmax(1, ts.denominator)); // tick to quarter (säkerhetsspärr)
         // Säkerhetsspärr: Förhindra division med noll ifall tickMultiplier blir 0.0
         const auto tickAt = ttq / juce::jmax(0.001f, currentTickMultiplier); 
@@ -772,10 +779,8 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
 
         const auto ppqFromBufStart = fmod (pos, tickAt);
         const double ppqOffset = tickAt - ppqFromBufStart;
-        const auto bufStartInSecs = playheadPosition_.getTimeInSeconds().orFallback(0);
-        const auto bufEndInSecs = bufStartInSecs + (buffer.getNumSamples() / sr);
-        const double ppqEndValLocal = pos + ((bufEndInSecs - bufStartInSecs) * bps);
-        const auto bufLengthInPPQ = bps * (buffer.getNumSamples() / sr);
+        const auto bufLengthInPPQ = bps * (buffer.getNumSamples() / currentSampleRate);
+        const double ppqEndValLocal = pos + bufLengthInPPQ;
 
         // stop if precount is on and counted enough bars
         handlePreCount (ppqEndValLocal + bufLengthInPPQ);
@@ -891,7 +896,7 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     {
         juce::dsp::AudioBlock<float> block (buffer.getArrayOfWritePointers(), safeChannels, safeSamples);
         juce::dsp::ProcessContextReplacing<float> context (block);
-        if (safeCutoff < (actualSr / 2.0) - 5.0)
+        if (safeCutoff < (currentSampleRate / 2.0) - 5.0)
             lpfFilter.process (context);
         else
             lpfFilter.reset(); // Rensa gammalt skräp ur historiken när filtret är öppet!
@@ -922,8 +927,7 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     {
         if (playheadPosition_.getIsPlaying() && ! m_link.isLinkConnected())
         {
-            const double safeSr = juce::jmax(1.0, getSampleRate()); // Säkerhetsspärr mot div-med-noll
-            const double bufInSecs = buffer.getNumSamples() / safeSr;
+            const double bufInSecs = buffer.getNumSamples() / currentSampleRate;
             const double iqps = playheadPosition_.getBpm().orFallback(120.0f) / 60.0;
             playheadPosition_.setPpqPosition (playheadPosition_.getPpqPosition().orFallback(0) + (iqps * bufInSecs));
             playheadPosition_.setTimeInSamples(playheadPosition_.getTimeInSamples().orFallback(0) + buffer.getNumSamples());
