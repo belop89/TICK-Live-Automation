@@ -287,7 +287,7 @@ void EditBeatView::SamplesModel::SampleOption::mouseDown (const juce::MouseEvent
                 {
                     // TODO: DRY with code below for adding new samples
                     auto addSamplesMenu = safeThis->owner.getAddSamplesMenu (safeThis->row);
-                    safeThis->owner.listboxMenu.reset (new jux::ListBoxMenu());
+                    safeThis->owner.listboxMenu = std::make_unique<jux::ListBoxMenu>();
                     safeThis->owner.listboxMenu->setRowHeight (50);
                     safeThis->owner.listboxMenu->setMenuFromPopup (std::move (addSamplesMenu));
                     safeThis->owner.listboxMenu->setShouldCloseOnItemClick (true);
@@ -442,7 +442,7 @@ void EditBeatView::SamplesModel::listBoxItemClicked (int row, const juce::MouseE
     {
         owner.updateSelection (owner.selection);
         auto menu = owner.getAddSamplesMenu();
-        owner.listboxMenu.reset (new jux::ListBoxMenu());
+        owner.listboxMenu = std::make_unique<jux::ListBoxMenu>();
         owner.listboxMenu->setShouldCloseOnItemClick (true);
         owner.listboxMenu->setRowHeight (50);
         owner.listboxMenu->setMenuFromPopup (std::move (menu));

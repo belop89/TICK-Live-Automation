@@ -60,6 +60,8 @@ void AbletonLink::linkPosition (juce::AudioPlayHead::PositionInfo& posInfo, cons
         
         if (std::abs(linkBeat - hostBeat) > 0.1)
         {
+            // Nätverks-Säkerhet: Använd 'quantum' istället för 0.0 för att undvika fmod(0) NaN-kraschar.
+            // Eftersom vi tvingar hoppet exakt till DAW:ens fas (hostBeat), sker hoppet ändå omedelbart!
             sessionState.requestBeatAtTime (hostBeat, time, quantum);
             stateChanged = true;
         }
@@ -67,6 +69,8 @@ void AbletonLink::linkPosition (juce::AudioPlayHead::PositionInfo& posInfo, cons
 
     if (requests.forceBeatAtTime.has_value())
     {
+        // Samma matematiska säkerhet här: Eftersom *requests.forceBeatAtTime alltid är ett avrundat heltal 
+        // när vi byter låt eller tappar (t.ex 0.0 eller 4.0), resulterar det alltid i fas 0 oavsett quantum!
         sessionState.requestBeatAtTime (*requests.forceBeatAtTime, time, quantum);
         stateChanged = true;
     }

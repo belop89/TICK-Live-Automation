@@ -263,8 +263,12 @@ void TickAudioProcessor::handlePreCount (const double inputPPQ)
     // förhindrar detta att inräkningen missar stoppet och metronomen fortsätter spela i all evighet!
     if ((int)expectedBar >= preCount)
     {
-        uiIsPlaying.store(0, std::memory_order_relaxed);
-        triggerAsyncUpdate();
+        // DSP-Optimering: Undvik att spamma meddelandekön om UI:t redan fått kommandot
+        if (uiIsPlaying.load(std::memory_order_relaxed) != 0)
+        {
+            uiIsPlaying.store(0, std::memory_order_relaxed);
+            triggerAsyncUpdate();
+        }
     }
 }
 
@@ -283,7 +287,7 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
 
     // 0. OS-Optimering: Hämta aktuell tid en enda gång per ljudblock för att undvika onödiga systemanrop
     const uint32_t blockTimeMs = juce::Time::getMillisecondCounter();
-    const double currentSampleRate = juce::jmax(44.0, getSampleRate()); // Garantera minst 44Hz
+    const double safeSampleRate = juce::jmax(44.0, getSampleRate()); // Garantera minst 44Hz
 
     // 1. Läs in atomics EN gång per block till lokala variabler för max prestanda
     const float currentFilterCutoff = filterCutoff->load(std::memory_order_relaxed);
@@ -660,13 +664,20 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         const auto ts = *playheadPosition_.getTimeSignature();
         if (currentSettingsNum != ts.numerator)
         {
-            uiNumerator.store(ts.numerator, std::memory_order_relaxed);
-            triggerAsyncUpdate();
+            // DSP-Optimering: Trigga bara en UI-uppdatering om brevlådan är tömd!
+            if (uiNumerator.load(std::memory_order_relaxed) < 0)
+            {
+                uiNumerator.store(ts.numerator, std::memory_order_relaxed);
+                triggerAsyncUpdate();
+            }
         }
         if (currentSettingsDenum != ts.denominator)
         {
-            uiDenominator.store(ts.denominator, std::memory_order_relaxed);
-            triggerAsyncUpdate();
+            if (uiDenominator.load(std::memory_order_relaxed) < 0)
+            {
+                uiDenominator.store(ts.denominator, std::memory_order_relaxed);
+                triggerAsyncUpdate();
+            }
         }
     }
 
@@ -677,13 +688,17 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     // (annars uppdateras inte filtret när du skruvar på det medan DAW:en står stilla!)
     // Säkerhet: Begränsa cutoff BÅDE i botten (20Hz) och toppen (Nyquist) för att förhindra
     // att filtret exploderar (NaN/krasch) ifall DAW-automationen drar värdet under 0!
-    const float safeCutoff = (float) juce::jlimit(20.0, (currentSampleRate / 2.0) - 1.0, (double)currentFilterCutoff);
+    const float safeCutoff = (float) juce::jlimit(20.0, (safeSampleRate / 2.0) - 1.0, (double)currentFilterCutoff);
     
     if (lastCutoffHz != safeCutoff)
     {
         lpfFilter.setCutoffFrequency(safeCutoff);
         lastCutoffHz = safeCutoff;
     }
+    
+    // DSP-Optimering: Utvärdera tempot en enda gång för hela ljudblocket 
+    // för att spara CPU-cykler och slippa packa upp std::optional upprepade gånger.
+    const double safeBpm = juce::jmax(1.0, playheadPosition_.getBpm().orFallback(120.0));
 
     if (isPlaying && !wasPlaying)
     {
@@ -714,13 +729,8 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
             nextClockPpq = std::ceil(currentPpq / pulseInterval) * pulseInterval;
         }
 
-        double bpm = playheadPosition_.getBpm().orFallback(120.0);
-        
-        // Säkerhetsspärr: Förhindra division med noll (vilket fryser DAW:en) om BPM saknas
-        if (bpm <= 0.0) bpm = 120.0;
-        
         // DSP-Optimering: (sr * 60.0) / bpm sparar processorn från en extra flyttalsdivision!
-        double samplesPerQuarter = (currentSampleRate * 60.0) / bpm;
+        double samplesPerQuarter = (safeSampleRate * 60.0) / safeBpm;
         
         // Beräkna var i denna buffer (PPQ) vi befinner oss
         double bufEndPpq = currentPpq + (buffer.getNumSamples() / samplesPerQuarter);
@@ -761,17 +771,14 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
         {
         const auto ppqPosition = playheadPosition_.getPpqPosition().orFallback(0);
         const auto lastBarStart = playheadPosition_.getPpqPositionOfLastBarStart().orFallback(0);
-        // Säkerhet: Förhindra Integer Overflow-krasch! Om DAW-automationen går nära 0 BPM, 
-        // blir antalet samples per slag > 2.14 miljarder vilket kraschar 32-bitars integers.
-        const auto bpm = juce::jmax(1.0f, (float)playheadPosition_.getBpm().orFallback(120.0f));
         const auto ts = playheadPosition_.getTimeSignature().orFallback(AudioPlayHead::TimeSignature ({1, 4}));
         
         // calculate where tick starts in samples...
         jassert ((int)lastBarStart == 0 || ppqPosition >= lastBarStart);
         // FIX: Förhindra negativ tid vid floating-point avrundningsfel från DAW:en
         const auto pos = juce::jmax(0.0, ppqPosition - lastBarStart);
-        const auto bps = bpm / 60.0;
-        const auto bpSmp = (currentSampleRate * 60.0) / bpm; // DSP-Optimering: Matematiskt förenklat för att slippa division
+        const auto bps = safeBpm / 60.0;
+        const auto bpSmp = (safeSampleRate * 60.0) / safeBpm; // DSP-Optimering: Matematiskt förenklat för att slippa division
         const auto ttq = (4.0 / juce::jmax(1, ts.denominator)); // tick to quarter (säkerhetsspärr)
         // Säkerhetsspärr: Förhindra division med noll ifall tickMultiplier blir 0.0
         const auto tickAt = ttq / juce::jmax(0.001f, currentTickMultiplier); 
@@ -779,7 +786,7 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
 
         const auto ppqFromBufStart = fmod (pos, tickAt);
         const double ppqOffset = tickAt - ppqFromBufStart;
-        const auto bufLengthInPPQ = bps * (buffer.getNumSamples() / currentSampleRate);
+        const auto bufLengthInPPQ = bps * (buffer.getNumSamples() / safeSampleRate);
         const double ppqEndValLocal = pos + bufLengthInPPQ;
 
         // stop if precount is on and counted enough bars
@@ -896,7 +903,7 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     {
         juce::dsp::AudioBlock<float> block (buffer.getArrayOfWritePointers(), safeChannels, safeSamples);
         juce::dsp::ProcessContextReplacing<float> context (block);
-        if (safeCutoff < (currentSampleRate / 2.0) - 5.0)
+        if (safeCutoff < (getSampleRate() / 2.0) - 5.0)
             lpfFilter.process (context);
         else
             lpfFilter.reset(); // Rensa gammalt skräp ur historiken när filtret är öppet!
@@ -923,11 +930,11 @@ void TickAudioProcessor::processBlock (AudioSampleBuffer& buffer, MidiBuffer& mi
     // LIVE SHOW OPTIMERING: Avancera standalone-tidslinjen HÄR i slutet av blocket!
     // BARA om Ableton Link INTE är anslutet. Är Link anslutet sköter nätverket all tid!
     // Annars dubbel-avancerar vi och skapar massivt jitter mot TouchDesigner.
-    if (! isHostSyncSupported() || ! currentSettingsUseHost)
+    if (! isHostSyncSupported() || ! isUseHost)
     {
         if (playheadPosition_.getIsPlaying() && ! m_link.isLinkConnected())
         {
-            const double bufInSecs = buffer.getNumSamples() / currentSampleRate;
+            const double bufInSecs = buffer.getNumSamples() / safeSampleRate;
             const double iqps = playheadPosition_.getBpm().orFallback(120.0f) / 60.0;
             playheadPosition_.setPpqPosition (playheadPosition_.getPpqPosition().orFallback(0) + (iqps * bufInSecs));
             playheadPosition_.setTimeInSamples(playheadPosition_.getTimeInSamples().orFallback(0) + buffer.getNumSamples());
@@ -979,8 +986,8 @@ void TickAudioProcessor::getStateInformation (MemoryBlock& destData)
 {
     // save
     MemoryOutputStream writeStream (destData, false);
-    settings.cutoffFilter.setValue (filterCutoff->load(), nullptr);
-    settings.masterGain.setValue (masterGain->load(), nullptr);
+    settings.cutoffFilter.setValue (filterCutoff->load(std::memory_order_relaxed), nullptr);
+    settings.masterGain.setValue (masterGain->load(std::memory_order_relaxed), nullptr);
     settings.saveToArchive (writeStream, ticks, false, false);
 }
 
@@ -1034,7 +1041,8 @@ void TickAudioProcessor::TickState::fillTickSample (AudioBuffer<float>& bufferTo
     for (auto ch = 0; ch < bufferToFill.getNumChannels(); ch++)
     {
         // Använd addFrom för att mixa (inte skriva över) och applicera gain lokalt!
-        bufferToFill.addFrom (ch, tickStartPosition, sample.getReadPointer(jlimit (0, maxSampleChannelIndex, ch), currentSample), constrainedLength, beatGain);
+        const float* readPtr = sample.getReadPointer (juce::jlimit (0, maxSampleChannelIndex, ch), currentSample);
+        bufferToFill.addFrom (ch, tickStartPosition, readPtr, constrainedLength, beatGain);
     }
 
     currentSample += constrainedLength;

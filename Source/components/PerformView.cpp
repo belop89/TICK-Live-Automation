@@ -85,7 +85,13 @@ void PerformView::selectionChanged (const int index, const bool propogateToEditV
     for (size_t idx = 0; idx < beats.size(); idx++)
     {
         jassert (idx < 64);
-        beats[idx]->isSelected = idx == (size_t) index;
+        const bool shouldBeSelected = (idx == (size_t) index);
+        
+        if (beats[idx]->isSelected != shouldBeSelected)
+        {
+            beats[idx]->isSelected = shouldBeSelected;
+            beats[idx]->repaint(); // GUI-Fix: Tvinga opritning så gamla slaget tappar sin markering!
+        }
     }
 }
 
@@ -113,7 +119,8 @@ void PerformView::resized()
     const auto isVertical = state.isVertical.get();
     beatsInRow = juce::jlimit (1, 8, juce::jmin (state.transport.numerator.get(), state.transport.denumerator.get()));
     // GUI-Säkerhet: Förhindra negativa dimensioner vid extremt snabb fönster-omskalning (kraschar FlexBox!)
-    const int beatSize = std::max(1, static_cast<int> (std::floor (((isVertical ? area.getHeight() : area.getWidth()) - 2 * kMargin)) / beatsInRow) - 2 * kMargin);
+    const int availableSpace = (isVertical ? area.getHeight() : area.getWidth()) - 2 * kMargin;
+    const int beatSize = std::max(1, (availableSpace / beatsInRow) - 2 * kMargin);
     const auto beatHeight = std::max(1, (int) std::min (beatSize, area.getHeight() - 3 * kMargin));
     const auto itemWidth = std::max(1, isVertical ? area.getWidth() - 2 * kMargin - viewport.getScrollBarThickness() : beatSize);
     const auto numOfBeats = state.transport.numerator.get();
